@@ -3,10 +3,12 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <stdint.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/timerfd.h>
 #include <pthread.h>
 #include <errno.h>
 #include "queue.h"
@@ -19,17 +21,24 @@
 #include "log.h"
 #include "protocol.h"
 #include "session.h"
-#include "file_cmds.h"
-#include "file_transfer.h"
-#include "path_utils.h"
-#include "sha256_utils.h"
 #include "db_init.h"
 #include "db_pool.h"
+#include "control_conn.h"
+#include "time_wheel.h"
+
+#define MAX_CONTROL_FD 65536
+#define CTRL_TIMEOUT_SEC 30
 
 // pipe_fd[0] 用来读，pipe_fd[1] 用来写。
 // 父进程收到 Ctrl+C 后，会往管道里写一个字节。
 // 子进程的 epoll 监听到这个字节后，就进入退出流程。
 int pipe_fd[2];
+
+typedef struct {
+    int epfd;
+    TimeWheel *wheel;
+    ControlConn **conn_map;
+} ExpireContext;
 
 /**
  * @brief  SIGINT 信号处理函数，通知子进程退出
@@ -88,43 +97,246 @@ static void init_log_with_fallback(const char *level_str, const char *log_file) 
 }
 
 /**
+ * @brief  创建并初始化 timerfd
+ * @return 成功返回 timerfd，失败返回 -1
+ */
+static int create_timer_fd(void) {
+    int timer_fd = -1;
+    struct itimerspec timer_spec;
+
+    timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
+    if (timer_fd == -1) {
+        return -1;
+    }
+
+    memset(&timer_spec, 0, sizeof(timer_spec));
+    timer_spec.it_interval.tv_sec = 1;
+    timer_spec.it_interval.tv_nsec = 0;
+    timer_spec.it_value.tv_sec = 1;
+    timer_spec.it_value.tv_nsec = 0;
+
+    if (timerfd_settime(timer_fd, 0, &timer_spec, NULL) == -1) {
+        close(timer_fd);
+        return -1;
+    }
+
+    return timer_fd;
+}
+
+/**
+ * @brief  关闭并回收一条控制连接
+ * @param  epfd epoll fd
+ * @param  wheel 时间轮结构体地址
+ * @param  conn_map 控制连接映射表
+ * @param  fd 控制连接 fd
+ * @return 无
+ */
+static void close_control_connection(int epfd, TimeWheel *wheel, ControlConn **conn_map, int fd) {
+    ControlConn *conn = NULL;
+
+    if (fd < 0 || fd >= MAX_CONTROL_FD) {
+        return;
+    }
+
+    conn = conn_map[fd];
+    if (conn == NULL) {
+        return;
+    }
+
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+    time_wheel_remove(wheel, conn);
+    close(fd);
+    free(conn);
+    conn_map[fd] = NULL;
+}
+
+/**
+ * @brief  时间轮超时回调函数
+ * @param  conn 控制连接结构体地址
+ * @param  arg 透传参数，实际类型为 ExpireContext*
+ * @return 无
+ */
+static void handle_control_timeout(ControlConn *conn, void *arg) {
+    ExpireContext *ctx = (ExpireContext *)arg;
+
+    if (conn == NULL || ctx == NULL) {
+        return;
+    }
+
+    LOG_INFO("控制连接超时，准备关闭，客户端fd=%d", conn->fd);
+    close_control_connection(ctx->epfd, ctx->wheel, ctx->conn_map, conn->fd);
+}
+
+/**
+ * @brief  处理 timerfd 就绪事件，推进时间轮
+ * @param  timer_fd timerfd
+ * @param  wheel 时间轮结构体地址
+ * @param  expire_ctx 时间轮回调上下文
+ * @return 无
+ */
+static void handle_timer_event(int timer_fd, TimeWheel *wheel, ExpireContext *expire_ctx) {
+    uint64_t expired_count = 0;
+    ssize_t ret = read(timer_fd, &expired_count, sizeof(expired_count));
+
+    if (ret != (ssize_t)sizeof(expired_count)) {
+        return;
+    }
+
+    while (expired_count > 0) {
+        time_wheel_tick(wheel, handle_control_timeout, expire_ctx);
+        expired_count--;
+    }
+}
+
+/**
+ * @brief  尝试把新连接注册为控制连接
+ * @param  epfd epoll fd
+ * @param  wheel 时间轮结构体地址
+ * @param  conn_map 控制连接映射表
+ * @param  conn_fd 新连接 fd
+ * @return 成功返回 0，失败返回 -1
+ */
+static int register_control_connection(int epfd, TimeWheel *wheel, ControlConn **conn_map, int conn_fd) {
+    ControlConn *conn = NULL;
+
+    if (conn_fd >= MAX_CONTROL_FD) {
+        return -1;
+    }
+
+    conn = (ControlConn *)calloc(1, sizeof(ControlConn));
+    if (conn == NULL) {
+        return -1;
+    }
+
+    control_conn_init(conn, conn_fd);
+    conn_map[conn_fd] = conn;
+
+    add_epoll_fd(epfd, conn_fd);
+    time_wheel_add(wheel, conn);
+    LOG_INFO("控制连接注册成功，客户端fd=%d", conn_fd);
+    return 0;
+}
+
+/**
+ * @brief  处理 listen_fd 上的新连接
+ * @param  epfd epoll fd
+ * @param  listen_fd 监听 fd
+ * @param  wheel 时间轮结构体地址
+ * @param  conn_map 控制连接映射表
+ * @param  pool 传输线程池地址
+ * @return 无
+ */
+static void handle_accept_event(int epfd, int listen_fd, TimeWheel *wheel,
+                                ControlConn **conn_map, thread_pool_t *pool) {
+    int conn_fd = 0;
+    conn_init_packet_t init_packet;
+
+    conn_fd = accept(listen_fd, NULL, NULL);
+    if (conn_fd == -1) {
+        LOG_WARN("接收客户端连接失败，错误码=%d", errno);
+        return;
+    }
+    LOG_INFO("接收到客户端连接，客户端fd=%d", conn_fd);
+
+    // 每条连接建立后，客户端都会先发一个角色初始化包。
+    // 服务端通过这里区分控制连接和传输连接。
+    if (recv_conn_init_packet(conn_fd, &init_packet) <= 0) {
+        LOG_WARN("接收连接初始化信息失败，客户端fd=%d", conn_fd);
+        close(conn_fd);
+        return;
+    }
+
+    if (init_packet.role == CONN_ROLE_CTRL) {
+        if (register_control_connection(epfd, wheel, conn_map, conn_fd) != 0) {
+            LOG_WARN("注册控制连接失败，客户端fd=%d", conn_fd);
+            close(conn_fd);
+        }
+        return;
+    }
+
+    if (init_packet.role == CONN_ROLE_TRANSFER) {
+        pthread_mutex_lock(&pool->lock);
+        enQueue(&pool->queue, conn_fd);
+        pthread_cond_signal(&pool->cond);
+        pthread_mutex_unlock(&pool->lock);
+        LOG_INFO("传输连接进入线程池，客户端fd=%d", conn_fd);
+        return;
+    }
+
+    LOG_WARN("连接角色无效，客户端fd=%d，角色=%d", conn_fd, init_packet.role);
+    close(conn_fd);
+}
+
+/**
+ * @brief  处理控制连接上的命令事件
+ * @param  epfd epoll fd
+ * @param  wheel 时间轮结构体地址
+ * @param  conn_map 控制连接映射表
+ * @param  fd 控制连接 fd
+ * @return 无
+ */
+static void handle_control_event(int epfd, TimeWheel *wheel, ControlConn **conn_map, int fd) {
+    ControlConn *conn = NULL;
+    command_packet_t cmd_packet;
+
+    if (fd < 0 || fd >= MAX_CONTROL_FD) {
+        return;
+    }
+
+    conn = conn_map[fd];
+    if (conn == NULL) {
+        return;
+    }
+
+    if (recv_command_packet(fd, &cmd_packet) <= 0) {
+        LOG_INFO("控制连接断开，客户端fd=%d", fd);
+        close_control_connection(epfd, wheel, conn_map, fd);
+        return;
+    }
+
+    dispatch_control_command(fd, &conn->ctx, &cmd_packet);
+    time_wheel_refresh(wheel, conn);
+}
+
+/**
  * @brief  服务端主函数，负责初始化配置、数据库、线程池和 epoll 主循环
  * @return 正常结束返回 0，失败返回非 0
  */
 int main(){
+    char ip[64] = {0};
+    char port[64] = {0};
+    char log_level[32] = {0};
+    char log_file[256] = {0};
+    char db_host[64] = {0};
+    char db_user[64] = {0};
+    char db_pwd[64] = {0};
+    char db_name[64] = {0};
+    int listen_fd = 0;
+    int epfd = -1;
+    int timer_fd = -1;
+    thread_pool_t pool;
+    TimeWheel wheel;
+    ControlConn **conn_map = NULL;
+    ExpireContext expire_ctx;
+
     // 忽略 SIGPIPE。
     // 这样当对端断开连接后，send 不会直接把进程打死。
     signal(SIGPIPE, SIG_IGN);
 
     //=====================加载配置========================
-    // ip 和 port 用来保存配置文件中的监听地址。
-    char ip[64] = {0}; 
-    char port[64] = {0};
-    char log_level[32] = {0};
-    char log_file[256] = {0};
-
-    // 先用默认日志路径初始化，确保配置加载阶段的日志也能写入。
     init_log_with_fallback("INFO", "../log/server.log");
 
-    // 加载配置。
     load_value_or_default("ip", ip, sizeof(ip), "127.0.0.1");
     load_value_or_default("port", port, sizeof(port), "9090");
     load_value_or_default("log", log_level, sizeof(log_level), "INFO");
     load_value_or_default("server_log", log_file, sizeof(log_file), "../log/server.log");
 
-    char db_host[64] = {0};
-    char db_user[64] = {0};
-    char db_pwd[64] = {0};
-    char db_name[64] = {0};
-
-    // 尝试从配置文件读，读不到就用默认值（这里默认用 root 和 密码 123456，供本地测试）
     load_value_or_default("db_host", db_host, sizeof(db_host), "127.0.0.1");
     load_value_or_default("db_user", db_user, sizeof(db_user), "root");
-    load_value_or_default("db_pwd",  db_pwd,  sizeof(db_pwd),  "123456"); 
+    load_value_or_default("db_pwd",  db_pwd,  sizeof(db_pwd),  "123456");
     load_value_or_default("db_name", db_name, sizeof(db_name), "netdisk_db");
 
     //=================先初始化日志========================
-    // 否则 socket/bind/accept 等调用一旦失败，ERROR_CHECK 无法安全打印日志。
     init_log_with_fallback(log_level, log_file);
     LOG_INFO("服务端配置加载完成，地址=%s，端口=%s", ip, port);
 
@@ -143,96 +355,99 @@ int main(){
     }
 
     //=================创建管道和子进程========================
-    // 创建匿名管道，用于父进程通知子进程退出。
     if (pipe(pipe_fd) != 0) {
         LOG_ERROR("创建管道失败: %s", strerror(errno));
         close_log();
         return 1;
     }
-    
+
     // fork 之后会分成父子两个进程。
     // 父进程专门负责监听 Ctrl+C。
     // 子进程负责真正跑服务器。
-    pid_t pid = fork();
-    if (pid < 0) {
-        LOG_ERROR("创建子进程失败: %s", strerror(errno));
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
-        close_log();
-        return 1;
+    {
+        pid_t pid = fork();
+        if (pid < 0) {
+            LOG_ERROR("创建子进程失败: %s", strerror(errno));
+            close(pipe_fd[0]);
+            close(pipe_fd[1]);
+            close_log();
+            return 1;
+        }
+
+        if(pid != 0){
+            signal(SIGINT, func);
+            LOG_INFO("服务端父进程等待子进程退出，子进程pid=%d", (int)pid);
+            wait(NULL);
+            LOG_INFO("服务端父进程退出");
+            exit(0);
+        }
     }
 
-    if(pid != 0){
-        // 父进程收到 SIGINT 后，就执行上面的 func。
-        signal(SIGINT, func);
-        LOG_INFO("服务端父进程等待子进程退出，子进程pid=%d", (int)pid);
-
-        // 父进程等待子进程结束。
-        wait(NULL);
-        LOG_INFO("服务端父进程退出");
-        exit(0);
-    }
-
-    // 子进程把自己放进新的进程组，避免和父进程完全绑死在一起。
     if (setpgid(0, 0) != 0) {
         LOG_WARN("设置进程组失败 errno=%d", errno);
     }
 
     //=================子进程继续执行服务端主逻辑========================
-
-    //-----------创建监听 socket----------------
-    // listen_fd 是服务端监听新连接用的 socket。
-    int listen_fd = 0;
     init_socket(&listen_fd, ip, port);
-
-    //-----------创建线程池----------------
-    thread_pool_t pool;
     init_thread_pool(&pool, 5);
+    time_wheel_init(&wheel, CTRL_TIMEOUT_SEC);
 
-    //-----------创建 epoll 实例----------------
-    int epfd = epoll_create(1);
+    conn_map = (ControlConn **)calloc(MAX_CONTROL_FD, sizeof(ControlConn *));
+    if (conn_map == NULL) {
+        LOG_ERROR("控制连接映射表申请失败");
+        destroy_thread_pool(&pool);
+        destroy_db_pool();
+        close(listen_fd);
+        close_log();
+        return 1;
+    }
+
+    timer_fd = create_timer_fd();
+    if (timer_fd == -1) {
+        LOG_ERROR("创建 timerfd 失败");
+        free(conn_map);
+        destroy_thread_pool(&pool);
+        destroy_db_pool();
+        close(listen_fd);
+        close_log();
+        return 1;
+    }
+
+    epfd = epoll_create(1);
     ERROR_CHECK(epfd, -1, "创建 epoll");
 
-    // 监听 listen_fd：表示有新客户端到来。
     add_epoll_fd(epfd, listen_fd);
-
-    // 监听 pipe_fd[0]：表示父进程通知子进程退出。
     add_epoll_fd(epfd, pipe_fd[0]);
+    add_epoll_fd(epfd, timer_fd);
+
+    expire_ctx.epfd = epfd;
+    expire_ctx.wheel = &wheel;
+    expire_ctx.conn_map = conn_map;
+
     LOG_INFO("服务端启动成功，地址=%s，端口=%s", ip, port);
 
-    // 主循环，持续等待 epoll 事件。
     while(1){
-        // lst 用来保存本轮就绪的事件列表。
-        struct epoll_event lst[10];
+        struct epoll_event events[32];
+        int nready = epoll_wait(epfd, events, 32, -1);
 
-        // epoll_wait 会阻塞，直到至少有一个 fd 就绪。
-        int nready = epoll_wait(epfd, lst, 10, -1);
         if (nready == -1) {
             if (errno == EINTR) {
                 continue;
             }
             ERROR_CHECK(nready, -1, "等待 epoll 事件");
         }
-        
-        // 依次处理本轮所有就绪事件。
+
         for(int idx = 0; idx < nready; idx++){
-            // 取出当前就绪的 fd。
-            int fd = lst[idx].data.fd;
+            int fd = events[idx].data.fd;
 
             if(fd == pipe_fd[0]){
-                // 读走管道中的退出通知字节。
                 char buf[10];
                 read(fd, buf, sizeof(buf));
                 LOG_INFO("服务端收到退出信号");
 
-                // 修改线程池共享数据前，先加锁。
                 pthread_mutex_lock(&pool.lock);
-
-                // 置 1 表示线程池进入退出状态。
                 pool.exitFlag = 1;
 
-                // 先把队列里还没处理的连接全部清掉。
-                // 否则线程被唤醒后，可能还会继续拿旧任务。
                 while(pool.queue.size > 0){
                     int client_fd = deQueue(&pool.queue);
                     if(client_fd != -1){
@@ -241,63 +456,54 @@ int main(){
                     }
                 }
 
-                // 再把每个工作线程当前正在处理的连接主动 shutdown。
-                // 这样阻塞在 recv 的线程更容易尽快返回。
                 for(int i = 0; i < pool.num; i++){
                     if(pool.busy_fds[i] != -1){
                         shutdown(pool.busy_fds[i], SHUT_RDWR);
                     }
                 }
 
-                // 唤醒所有还睡在条件变量上的线程。
                 pthread_cond_broadcast(&pool.cond);
                 pthread_mutex_unlock(&pool.lock);
 
-                // 监听 socket 也可以关掉了，因为服务端已经准备退出，不再接新连接。
                 close(listen_fd);
-                
-                // 等待每个工作线程退出。
+
+                for (int conn_fd = 0; conn_fd < MAX_CONTROL_FD; conn_fd++) {
+                    if (conn_map[conn_fd] != NULL) {
+                        close_control_connection(epfd, &wheel, conn_map, conn_fd);
+                    }
+                }
+
                 for(int i = 0; i < pool.num; i++){
                     pthread_join(pool.thread_id_arr[i], NULL);
                 }
 
-                // 回收线程池资源。
                 destroy_thread_pool(&pool);
-
-                // 销毁数据库连接池。
                 destroy_db_pool();
 
-                // 关闭管道两端和 epoll。
+                close(timer_fd);
                 close(pipe_fd[0]);
                 close(pipe_fd[1]);
                 close(epfd);
+                free(conn_map);
 
-                // 最后关闭日志。
                 close_log();
                 return 0;
             }
 
-            if(fd == listen_fd){
-                // 有新客户端到来时，accept 会返回一个新的连接 fd。
-                int conn_fd = accept(listen_fd, NULL, NULL);
-                if (conn_fd == -1) {
-                    LOG_WARN("接收客户端连接失败，错误码=%d", errno);
-                    continue;
-                }
-                LOG_INFO("接收到客户端连接，客户端fd=%d", conn_fd);
-
-                // 把新连接放进线程池任务队列。
-                pthread_mutex_lock(&pool.lock);
-                enQueue(&pool.queue, conn_fd);
-
-                // 唤醒一个工作线程来处理这个新连接。
-                pthread_cond_signal(&pool.cond);
-                pthread_mutex_unlock(&pool.lock);
+            if(fd == timer_fd){
+                handle_timer_event(timer_fd, &wheel, &expire_ctx);
+                continue;
             }
+
+            if(fd == listen_fd){
+                handle_accept_event(epfd, listen_fd, &wheel, conn_map, &pool);
+                continue;
+            }
+
+            handle_control_event(epfd, &wheel, conn_map, fd);
         }
     }
 
-    // 理论上正常不会走到这里，写上只是让资源回收更完整。
     close_log();
     return 0;
 }

@@ -1,7 +1,7 @@
 # 1. 编译器与选项
 CC      = gcc
 CFLAGS  = -Wall -Wextra -g -Iinclude # 包含头文件目录
-LIBS    = -lpthread -lcrypto -lmysqlclient  # 链接线程库、加密库和 MySQL 客户端库
+LIBS    = -lpthread -lcrypto -lmysqlclient -ll8w8jwt  # 链接线程库、加密库、MySQL 客户端库和 JWT 库
 
 # 2. 目录定义
 SRC_DIR    = src

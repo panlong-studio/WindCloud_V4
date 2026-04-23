@@ -10,15 +10,16 @@
 #include <errno.h>
 #include "client_socket.h"
 #include "config.h"
+#include "client_state.h"
 #include "client_command_handle.h"   // 新增头文件
 #include "log.h"
 
 /**
  * @brief  显示客户端未登录菜单，并处理登录/注册流程
- * @param  sock_fd 客户端套接字
+ * @param  state 客户端统一状态结构体
  * @return 成功进入已登录状态返回 0，失败返回 -1
  */
-static int client_login_menu(int sock_fd){
+static int client_login_menu(ClientState *state){
     char input[512];
     printf("\n================================\n");
     printf("\n  欢迎使用 WindCloud 云盘系统！  \n");
@@ -47,7 +48,7 @@ static int client_login_menu(int sock_fd){
         // 未登录阶段只接受 login / register / quit。
         // 其余输入会被忽略，继续停留在当前菜单循环中。
         if(strncmp(input,"login ",6)==0||strncmp(input,"register ",9)==0){
-            int ret=process_command(sock_fd,input);
+            int ret=process_command(state,input);
             if(ret==1&&strncmp(input,"login ",6)==0){
                 LOG_INFO("用户登录成功");
                 printf("\n>>>>>登录成功<<<<<\n");
@@ -129,7 +130,7 @@ int main(int argc, char *argv[])
     char log_level[32] = {0};
     char log_file[256] = {0};
 
-    // 先用默认日志路径初始化，确保配置加载阶段的日志也能落盘。
+    // 先用默认日志路径初始化，确保配置加载阶段的日志也能写入文件。
     init_log_with_fallback("INFO", "../log/client.log");
 
     // 从配置文件中读取 IP、端口和日志参数。
@@ -143,17 +144,34 @@ int main(int argc, char *argv[])
     init_log_with_fallback(log_level, log_file);
     signal(SIGPIPE, SIG_IGN);
 
-    // sock_fd 就是客户端和服务端通信用的 socket。
-    int sock_fd = 0;
+    // 准备客户端统一状态结构体。
+    ClientState state;
+    memset(&state, 0, sizeof(state));
+    pthread_mutex_init(&state.lock, NULL);
+    strcpy(state.current_path, "/");
+    snprintf(state.server_ip, sizeof(state.server_ip), "%s", ip);
+    snprintf(state.server_port, sizeof(state.server_port), "%s", port);
 
     // 主动连接到服务端。
-    init_socket(&sock_fd, ip, port);
+    init_socket(&state.ctrl_fd, ip, port);
     LOG_INFO("客户端已连接服务器，地址=%s，端口=%s", ip, port);
 
+    // 控制连接建立后，先告诉服务端：这是一条控制连接。
+    conn_init_packet_t init_packet;
+    init_conn_init_packet(&init_packet, CONN_ROLE_CTRL);
+    if (send_conn_init_packet(state.ctrl_fd, &init_packet) == -1) {
+        LOG_ERROR("发送控制连接初始化信息失败");
+        close(state.ctrl_fd);
+        pthread_mutex_destroy(&state.lock);
+        close_log();
+        return -1;
+    }
+
     // 进入登录/注册菜单。
-    if(client_login_menu(sock_fd) == -1) {
+    if(client_login_menu(&state) == -1) {
         LOG_ERROR("客户端登录/注册菜单发生错误");
-        close(sock_fd);
+        close(state.ctrl_fd);
+        pthread_mutex_destroy(&state.lock);
         return -1;
     }
 
@@ -194,12 +212,13 @@ int main(int argc, char *argv[])
 
         // 真正的命令发送、上传下载、结果接收，都交给 process_command 去做。
         LOG_DEBUG("客户端开始处理命令，输入=%s", input);
-        process_command(sock_fd, input);
+        process_command(&state, input);
     }
 
     // 退出前关闭 socket。
-    close(sock_fd);
+    close(state.ctrl_fd);
     LOG_INFO("客户端套接字已关闭");
+    pthread_mutex_destroy(&state.lock);
 
     // 关闭日志系统。
     close_log();

@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include "worker.h"
 #include "thread_pool.h"
 #include "queue.h"
@@ -61,8 +62,17 @@ void* thread_func(void *arg) {
         // 打印调试信息，方便观察哪个线程在工作。
         LOG_INFO("工作线程开始处理客户端，线程=%lu，客户端fd=%d", (unsigned long)pthread_self(), client_fd);
 
-        // 真正处理这个客户端的所有命令。
-        handle_request(client_fd);  // 你的处理函数
+        // 给传输连接增加读写超时，避免线程长时间卡在异常连接上。
+        {
+            struct timeval timeout;
+            timeout.tv_sec = 30;
+            timeout.tv_usec = 0;
+            setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        }
+
+        // 工作线程现在只处理传输连接。
+        handle_transfer_request(client_fd);
 
         // 处理完后，主动 shutdown 一次，确保连接进入关闭流程。
         shutdown(client_fd, SHUT_RDWR);

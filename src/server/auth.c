@@ -7,6 +7,8 @@
 #include "auth.h"
 #include "session.h"
 #include "dao_user.h"
+#include "jwt_utils.h"
+#include "protocol.h"
 #include "log.h"
 
 /**
@@ -114,12 +116,15 @@ void handle_register(int client_fd,const char*data,int *user_id){
  * @return 无
  */
 void handle_login(int client_fd,const char*data,int *user_id){
+    auth_reply_packet_t reply_packet;
+
     // 登录参数和注册参数的协议格式一致，同样使用 / 分隔用户名和密码。
     char *user_name=strtok((char*)data,"/");
     char *user_passwd=strtok(NULL,"\r\n\t");
 
     if(!user_name || !user_passwd){
-        send_msg(client_fd,"错误：用户名或密码格式不正确");
+        init_auth_reply_packet(&reply_packet, 0, -1, "错误：用户名或密码格式不正确", NULL);
+        send_auth_reply_packet(client_fd, &reply_packet);
         *user_id=-1;
         return;
     }
@@ -131,7 +136,8 @@ void handle_login(int client_fd,const char*data,int *user_id){
     // 第一步：先按用户名查询数据库中的用户 id、盐值和历史哈希。
     if(dao_get_user_by_name(user_name,&db_user_id,stored_hash,salt)!=0){
         *user_id=-1;
-        send_msg(client_fd,"用户名不存在");
+        init_auth_reply_packet(&reply_packet, 0, -1, "用户名不存在", NULL);
+        send_auth_reply_packet(client_fd, &reply_packet);
         return;
     }
 
@@ -140,14 +146,23 @@ void handle_login(int client_fd,const char*data,int *user_id){
     hash_password_with_salt(user_passwd, salt, computed_hash);
 
     if(strcmp(computed_hash,stored_hash)==0){
+        char token[TOKEN_LEN] = {0};
+
         // 比对成功，说明密码正确，登录通过。
         *user_id=db_user_id;
-        char msg[128];
-        snprintf(msg, sizeof(msg), "登录成功！欢迎您，user_id=%d！", *user_id);
-        send_msg(client_fd, msg);
+        if (jwt_create_for_user(*user_id, token, sizeof(token)) != 0) {
+            *user_id = -1;
+            init_auth_reply_packet(&reply_packet, 0, -1, "登录失败：生成令牌失败", NULL);
+            send_auth_reply_packet(client_fd, &reply_packet);
+            return;
+        }
+
+        init_auth_reply_packet(&reply_packet, 1, *user_id, "登录成功", token);
+        send_auth_reply_packet(client_fd, &reply_packet);
     }else{
         // 比对失败，只返回“密码错误”，不泄露更多数据库细节。
         *user_id=-1;
-        send_msg(client_fd,"密码错误");
+        init_auth_reply_packet(&reply_packet, 0, -1, "密码错误", NULL);
+        send_auth_reply_packet(client_fd, &reply_packet);
     } 
 }

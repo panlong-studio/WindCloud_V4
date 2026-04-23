@@ -167,6 +167,77 @@ void init_file_packet(file_packet_t *packet, cmd_type_t type, const char *file_n
 }
 
 /**
+ * @brief  初始化连接初始化结构体
+ * @param  packet 要写入的连接初始化结构体地址
+ * @param  role 连接角色
+ * @return 无
+ */
+void init_conn_init_packet(conn_init_packet_t *packet, conn_role_t role) {
+    memset(packet, 0, sizeof(conn_init_packet_t));
+    packet->role = role;
+}
+
+/**
+ * @brief  初始化传输认证结构体
+ * @param  packet 要写入的传输认证结构体地址
+ * @param  ticket 一次性传输票据
+ * @return 无
+ */
+void init_transfer_auth_packet(transfer_auth_packet_t *packet, const char *ticket) {
+    memset(packet, 0, sizeof(transfer_auth_packet_t));
+
+    if (ticket != NULL) {
+        strncpy(packet->ticket, ticket, TRANSFER_TICKET_LEN - 1);
+    }
+}
+
+/**
+ * @brief  初始化登录响应结构体
+ * @param  packet 要写入的登录响应结构体地址
+ * @param  success 是否成功
+ * @param  user_id 用户 id
+ * @param  message 提示信息
+ * @param  token JWT 字符串
+ * @return 无
+ */
+void init_auth_reply_packet(auth_reply_packet_t *packet, int success, int user_id,
+                            const char *message, const char *token) {
+    memset(packet, 0, sizeof(auth_reply_packet_t));
+    packet->success = success;
+    packet->user_id = user_id;
+
+    if (message != NULL) {
+        strncpy(packet->message, message, CMD_DATA_LEN - 1);
+    }
+
+    if (token != NULL) {
+        strncpy(packet->token, token, TOKEN_LEN - 1);
+    }
+}
+
+/**
+ * @brief  初始化一次性传输票据响应结构体
+ * @param  packet 要写入的响应结构体地址
+ * @param  success 是否成功
+ * @param  message 提示信息
+ * @param  ticket 一次性传输票据
+ * @return 无
+ */
+void init_transfer_ticket_reply_packet(transfer_ticket_reply_packet_t *packet,
+                                       int success, const char *message, const char *ticket) {
+    memset(packet, 0, sizeof(transfer_ticket_reply_packet_t));
+    packet->success = success;
+
+    if (message != NULL) {
+        strncpy(packet->message, message, CMD_DATA_LEN - 1);
+    }
+
+    if (ticket != NULL) {
+        strncpy(packet->ticket, ticket, TRANSFER_TICKET_LEN - 1);
+    }
+}
+
+/**
  * @brief  发送一个完整的普通命令包
  * @param  fd socket 文件描述符
  * @param  packet 要发送的普通命令结构体地址
@@ -229,5 +300,105 @@ int recv_file_packet(int fd, file_packet_t *packet) {
 
     // 再补一个 '\0'，保证 file_name 一定能当字符串用。
     packet->file_name[FILE_NAME_LEN - 1] = '\0';
+    return ret;
+}
+
+/**
+ * @brief  发送一个完整的连接初始化结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 要发送的结构体地址
+ * @return 成功返回 0，失败返回 -1
+ */
+int send_conn_init_packet(int fd, const conn_init_packet_t *packet) {
+    return send_full(fd, packet, sizeof(conn_init_packet_t));
+}
+
+/**
+ * @brief  接收一个完整的连接初始化结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 输出参数，用来保存接收结果
+ * @return 成功时返回接收字节数，失败返回 <= 0 或 -1
+ */
+int recv_conn_init_packet(int fd, conn_init_packet_t *packet) {
+    return recv_full(fd, packet, sizeof(conn_init_packet_t));
+}
+
+/**
+ * @brief  发送一个完整的传输认证结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 要发送的结构体地址
+ * @return 成功返回 0，失败返回 -1
+ */
+int send_transfer_auth_packet(int fd, const transfer_auth_packet_t *packet) {
+    return send_full(fd, packet, sizeof(transfer_auth_packet_t));
+}
+
+/**
+ * @brief  接收一个完整的传输认证结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 输出参数，用来保存接收结果
+ * @return 成功时返回接收字节数，失败返回 <= 0 或 -1
+ */
+int recv_transfer_auth_packet(int fd, transfer_auth_packet_t *packet) {
+    int ret = recv_full(fd, packet, sizeof(transfer_auth_packet_t));
+    if (ret <= 0) {
+        return ret;
+    }
+
+    packet->ticket[TRANSFER_TICKET_LEN - 1] = '\0';
+    return ret;
+}
+
+/**
+ * @brief  发送一个完整的登录响应结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 要发送的结构体地址
+ * @return 成功返回 0，失败返回 -1
+ */
+int send_auth_reply_packet(int fd, const auth_reply_packet_t *packet) {
+    return send_full(fd, packet, sizeof(auth_reply_packet_t));
+}
+
+/**
+ * @brief  接收一个完整的登录响应结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 输出参数，用来保存接收结果
+ * @return 成功时返回接收字节数，失败返回 <= 0 或 -1
+ */
+int recv_auth_reply_packet(int fd, auth_reply_packet_t *packet) {
+    int ret = recv_full(fd, packet, sizeof(auth_reply_packet_t));
+    if (ret <= 0) {
+        return ret;
+    }
+
+    packet->message[CMD_DATA_LEN - 1] = '\0';
+    packet->token[TOKEN_LEN - 1] = '\0';
+    return ret;
+}
+
+/**
+ * @brief  发送一个完整的一次性传输票据响应结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 要发送的结构体地址
+ * @return 成功返回 0，失败返回 -1
+ */
+int send_transfer_ticket_reply_packet(int fd, const transfer_ticket_reply_packet_t *packet) {
+    return send_full(fd, packet, sizeof(transfer_ticket_reply_packet_t));
+}
+
+/**
+ * @brief  接收一个完整的一次性传输票据响应结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 输出参数，用来保存接收结果
+ * @return 成功时返回接收字节数，失败返回 <= 0 或 -1
+ */
+int recv_transfer_ticket_reply_packet(int fd, transfer_ticket_reply_packet_t *packet) {
+    int ret = recv_full(fd, packet, sizeof(transfer_ticket_reply_packet_t));
+    if (ret <= 0) {
+        return ret;
+    }
+
+    packet->message[CMD_DATA_LEN - 1] = '\0';
+    packet->ticket[TRANSFER_TICKET_LEN - 1] = '\0';
     return ret;
 }
