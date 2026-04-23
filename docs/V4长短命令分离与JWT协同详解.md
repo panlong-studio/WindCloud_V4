@@ -156,9 +156,9 @@ flowchart TD
     A0[客户端已建立主连接]
     A1[用户输入 login 用户名/密码]
     A2[主连接发送 LOGIN 命令]
-    A3[服务端主线程处理 login]
-    A4[jwt_create_token]
-    A5[服务端通过主连接发送 token_packet_t]
+    A3[服务端主线程处理 login 并先返回登录结果]
+    A4[登录成功后调用 jwt_create_token]
+    A5[服务端通过主连接追加发送 token_packet_t]
     A6[客户端保存 token 到 ClientAppContext]
     A7[用户继续输入命令]
     A8{是短命令还是 puts/gets}
@@ -252,10 +252,11 @@ sequenceDiagram
     MainConn->>SMain: recv_command_packet()
     SMain->>Sess: session_handle_main_command()
     Sess->>Sess: handle_login()
+    Sess->>MainConn: send command_packet_t(REPLY, 登录结果)
+    MainConn-->>CMain: recv_server_reply()
     Sess->>JWT: jwt_create_token(user_id, user_name, 3600)
     JWT-->>Sess: 返回 token
     Sess->>MainConn: send token_packet_t(token, is_ok=1)
-    MainConn-->>CMain: recv_server_reply()
     MainConn-->>CMain: recv_token_packet()
     CMain->>AppCtx: 保存 token, is_logged_in=1, current_path=/
 
@@ -604,13 +605,16 @@ stateDiagram-v2
 
 ### 10.1.2 `ServerConnState` 只长期服务主连接
 
-服务端主线程为每条主连接维护 `ServerConnState`，里面保存：
+服务端主线程会先为每条新连接建立一份默认的 `ServerConnState`。  
+对于主连接，这份状态会长期保留并持续刷新；对于独立传输连接，这份状态只是主线程识别协议类型前的临时登记，认证成功后就会从 `ConnManager` 中移除。
+
+长期保留在主连接上的 `ServerConnState` 里面主要保存：
 
 1. `is_logged_in`
 2. `user_id`
 3. `current_path`
 4. `current_dir_id`
-5. `token`
+5. `token`（正常情况下非空）
 6. 时间轮相关字段
 
 对应代码：
@@ -620,7 +624,7 @@ stateDiagram-v2
 
 这里最关键的一点是：
 
-> 独立传输连接不会直接拿这份主连接状态继续执行上传下载
+> 独立传输连接不会直接拿主连接那份长期状态继续执行上传下载
 
 原因不是做不到，而是这样会把主连接、传输连接、线程池三者的耦合拉得很重。  
 当前实现改为“在独立传输连接上重新认证一次，并只恢复本次传输真正需要的最小上下文”。
