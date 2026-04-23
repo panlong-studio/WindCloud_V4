@@ -1,11 +1,16 @@
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include "session.h"
 #include "protocol.h"
 #include "log.h"
 #include "file_cmds.h"
 #include "file_transfer.h"
 #include "auth.h"
+#include "jwt.h"
+#include "dao_vfs.h"
+
+#define JWT_EXPIRE_SECONDS 3600
 
 /**
  * @brief  向客户端发送一条普通文本响应
@@ -16,139 +21,292 @@
 void send_msg(int client_fd, const char *msg) {
     command_packet_t reply_packet;
 
-    // 服务端的普通响应统一封装成 CMD_TYPE_REPLY。
-    // 客户端收到后会按普通文本路径直接打印。
+    // 第一步：把文本消息封装成统一的普通响应包。
     init_command_packet(&reply_packet, CMD_TYPE_REPLY, msg);
 
+    // 第二步：把响应包发送给客户端。
     if (send_command_packet(client_fd, &reply_packet) == -1) {
         LOG_WARN("发送响应失败，客户端fd=%d，消息=%s", client_fd, msg);
         return;
     }
+
     LOG_DEBUG("响应发送成功，客户端fd=%d，消息=%s", client_fd, msg);
 }
 
 /**
- * @brief  从普通命令包中解析命令类型
- * @param  cmd_packet 已接收的普通命令包
- * @return 成功返回命令类型，失败返回 CMD_TYPE_INVALID
+ * @brief  从登录参数里提取用户名
+ * @param  login_data 登录参数字符串，格式为 用户名/密码
+ * @param  user_name 输出参数，用来保存用户名
+ * @param  user_name_size user_name 缓冲区大小
+ * @return 成功返回 0，失败返回 -1
  */
-static cmd_type_t get_packet_cmd_type(const command_packet_t *cmd_packet) {
-    if (cmd_packet == NULL) {
-        return CMD_TYPE_INVALID;
+static int parse_login_user_name(const char *login_data, char *user_name, size_t user_name_size) {
+    char tmp[CMD_DATA_LEN] = {0};
+    char *name_ptr = NULL;
+
+    // 第一步：先校验输入参数。
+    if (login_data == NULL || user_name == NULL || user_name_size == 0) {
+        return -1;
     }
-    return (cmd_type_t)cmd_packet->cmd_type;
+
+    // 第二步：把原始登录字符串复制到临时缓冲区。
+    // 后续需要使用 strtok 做分隔，因此不能直接修改调用方传入的内容。
+    strncpy(tmp, login_data, sizeof(tmp) - 1);
+
+    // 第三步：按“用户名/密码”格式提取用户名。
+    name_ptr = strtok(tmp, "/");
+    if (name_ptr == NULL) {
+        return -1;
+    }
+
+    // 第四步：把用户名复制给调用方。
+    strncpy(user_name, name_ptr, user_name_size - 1);
+    user_name[user_name_size - 1] = '\0';
+    return 0;
 }
 
 /**
- * @brief  处理一个客户端连接上的完整请求生命周期
- * @param  client_fd 当前客户端套接字
- * @return 无
+ * @brief  根据当前逻辑路径恢复 current_dir_id
+ * @param  user_id 用户 id
+ * @param  current_path 当前逻辑路径
+ * @param  current_dir_id 输出参数，用来保存目录节点 id
+ * @return 成功返回 0，失败返回 -1
  */
-void handle_request(int client_fd) {
+static int restore_current_dir_id(int user_id, const char *current_path, int *current_dir_id) {
+    int node_id = 0;
+    int node_type = 0;
+
+    // 第一步：校验输入参数。
+    if (current_path == NULL || current_dir_id == NULL) {
+        return -1;
+    }
+
+    // 第二步：根目录在当前项目中约定为 current_dir_id = 0。
+    if (strcmp(current_path, "/") == 0) {
+        *current_dir_id = 0;
+        return 0;
+    }
+
+    // 第三步：对于非根目录路径，到 paths 表中查询目录节点。
+    if (dao_get_node_by_path(user_id, current_path, &node_id, &node_type) != 0) {
+        return -1;
+    }
+
+    // 第四步：只有目录节点才能作为 current_dir_id。
+    if (node_type != 1) {
+        return -1;
+    }
+
+    // 第五步：回填目录节点 id。
+    *current_dir_id = node_id;
+    return 0;
+}
+
+/**
+ * @brief  在主线程中处理一个普通命令
+ * @param  client_fd 当前客户端套接字
+ * @param  state 当前连接状态
+ * @param  cmd_packet 已接收的普通命令包
+ * @return 成功返回 0，失败返回 -1
+ */
+int session_handle_main_command(int client_fd, ServerConnState *state, command_packet_t *cmd_packet) {
     ClientContext ctx;
+    cmd_type_t cmd_type;
 
-    // 每个客户端连接，都维护一个独立的 ClientContext。
-    // 它就像“这个用户当前会话的小档案”，里面保存：
-    // 1. 当前是谁（user_id）
-    // 2. 当前在哪个虚拟目录（current_path）
-    // 3. 当前目录节点 id 是多少（current_dir_id）
-    // 后面 pwd / cd / ls / puts / gets 全都依赖它。
-    //
-    // 先把整个上下文清零，避免里面残留脏数据。
-    memset(&ctx, 0, sizeof(ctx));
+    // 第一步：校验输入参数。
+    if (state == NULL || cmd_packet == NULL) {
+        return -1;
+    }
 
-    // 新连接默认还没有登录。
-    ctx.user_id = -1;
+    // 第二步：把当前连接状态转换成业务层使用的 ClientContext。
+    if (conn_state_to_client_ctx(state, &ctx) != 0) {
+        return -1;
+    }
 
-    // 初始虚拟路径固定为根目录。
-    strcpy(ctx.current_path, "/");
+    // 第三步：读取本次命令类型，供后续分发使用。
+    cmd_type = (cmd_type_t)cmd_packet->cmd_type;
+    LOG_DEBUG("主线程处理命令，客户端fd=%d，命令类型=%d，参数=%s", client_fd, cmd_type, cmd_packet->data);
 
-    // 根目录约定 current_dir_id 为 0。
-    ctx.current_dir_id = 0;
+    // 第四步：未登录状态只允许 login 和 register。
+    if (ctx.user_id == -1 && cmd_type != CMD_TYPE_LOGIN && cmd_type != CMD_TYPE_REGISTER) {
+        send_msg(client_fd, "请先登录!");
+        return 0;
+    }
 
-    while (1) {
-        command_packet_t cmd_packet;
+    // 第五步：按命令类型分发到对应业务处理函数。
+    switch (cmd_type) {
+        case CMD_TYPE_LOGIN: {
+            int old_user_id = ctx.user_id;
+            char user_name[JWT_USER_NAME_LEN] = {0};
+            char token[TOKEN_LEN] = {0};
 
-        // handle_request 是“一个客户端连接上的总循环”。
-        // 客户端不断发命令，这里就不断收命令。
-        // 一旦 recv_command_packet 返回 <= 0，说明连接断开或出错，这个会话就结束。
-        if (recv_command_packet(client_fd, &cmd_packet) <= 0) {
-            LOG_INFO("客户端连接断开，客户端fd=%d，当前路径=%s", client_fd, ctx.current_path);
+            // 登录时先从原始参数中提取用户名，随后执行密码校验。
+            parse_login_user_name(cmd_packet->data, user_name, sizeof(user_name));
+            handle_login(client_fd, cmd_packet->data, &ctx.user_id);
+
+            // 只有“之前未登录、现在登录成功”时，才初始化根目录状态并签发 token。
+            if (old_user_id == -1 && ctx.user_id != -1) {
+                strcpy(ctx.current_path, "/");
+                ctx.current_dir_id = 0;
+
+                // 生成 token 成功时，把 token 保存到连接状态，并发送给客户端。
+                if (jwt_create_token(ctx.user_id, user_name, JWT_EXPIRE_SECONDS, token, sizeof(token)) == 0) {
+                    strncpy(state->token, token, sizeof(state->token) - 1);
+                    token_packet_t token_packet;
+                    init_token_packet(&token_packet, state->token, 1);
+                    send_token_packet(client_fd, &token_packet);
+                } else {
+                    // token 生成失败时，仍然返回一个无效 token 包，便于客户端明确识别异常。
+                    token_packet_t token_packet;
+                    state->token[0] = '\0';
+                    init_token_packet(&token_packet, NULL, 0);
+                    send_token_packet(client_fd, &token_packet);
+                }
+            }
             break;
         }
 
-        cmd_type_t cmd_type = get_packet_cmd_type(&cmd_packet);
-        LOG_DEBUG("收到客户端命令，客户端fd=%d，命令类型=%d，数据=%s", client_fd, cmd_type, cmd_packet.data);
-
-        // 没登录时，除了登录和注册，别的命令都不允许执行。
-        if(ctx.user_id == -1 && cmd_type != CMD_TYPE_LOGIN && cmd_type != CMD_TYPE_REGISTER) {
-            LOG_WARN("未登录用户尝试执行命令，客户端fd=%d，命令类型=%d", client_fd, cmd_type);
-            send_msg(client_fd, "请先登录!");
-            continue;
+        case CMD_TYPE_REGISTER: {
+            int temp_new_id = -1;
+            handle_register(client_fd, cmd_packet->data, &temp_new_id);
+            break;
         }
 
-        // 进入统一命令分发。
-        // 每条命令都会基于当前会话上下文 ctx 继续处理。
-        switch (cmd_type) {
-            case CMD_TYPE_LOGIN: {
-                int old_user_id = ctx.user_id;// 记录登录前的 user_id，看看登录后有没有变化
-                handle_login(client_fd, cmd_packet.data, &ctx.user_id);
-
-                // 登录成功后，把会话路径重新放回根目录。
-                // 这样无论这个连接之前是什么状态，一旦登录成功，
-                // 后续目录类命令都从 "/" 开始，逻辑最清楚。
-                if (old_user_id == -1 && ctx.user_id != -1) {// 之前没登录，现在登录成功了
-                    LOG_INFO("用户登录成功，客户端fd=%d，用户id=%d", client_fd, ctx.user_id);
-                    strcpy(ctx.current_path, "/");
-                    ctx.current_dir_id = 0;
-                }
-                break;
-            }
-
-            case CMD_TYPE_REGISTER: {
-                int temp_new_id=-1;
-                handle_register(client_fd, cmd_packet.data, &temp_new_id);
-
-                // 当前注册成功后，客户端仍然需要再执行一次 login。
-                if(temp_new_id!=-1){
-                    LOG_INFO("新用户注册成功，客户端fd=%d，新用户id=%d", client_fd, temp_new_id);
-                } else {
-                    LOG_WARN("用户注册失败，客户端fd=%d", client_fd);
-                }
-                break;
-            }
-
-            case CMD_TYPE_PWD:
-                handle_pwd(client_fd, &ctx);
-                break;
-            case CMD_TYPE_CD:
-                handle_cd(client_fd, &ctx, cmd_packet.data);
-                break;
-            case CMD_TYPE_LS:
-                handle_ls(client_fd, &ctx);
-                break;
-            case CMD_TYPE_GETS:
-                handle_gets(client_fd, &ctx, cmd_packet.data);
-                break;
-            case CMD_TYPE_PUTS:
-                handle_puts(client_fd, &ctx, cmd_packet.data);
-                break;
-            case CMD_TYPE_TOUCH:
-                handle_touch(client_fd, &ctx, cmd_packet.data);
-                break;
-            case CMD_TYPE_RM:
-                handle_rm(client_fd, &ctx, cmd_packet.data);
-                break;
-            case CMD_TYPE_MKDIR:
-                handle_mkdir(client_fd, &ctx, cmd_packet.data);
-                break;
-            case CMD_TYPE_RMDIR:
-                handle_rmdir(client_fd, &ctx, cmd_packet.data);
-                break;
-            default:
-                LOG_WARN("命令类型无效，客户端fd=%d，命令类型=%d", client_fd, cmd_type);
-                send_msg(client_fd, "指令错误!");
-                break;
-        }
+        case CMD_TYPE_PWD:
+            handle_pwd(client_fd, &ctx);
+            break;
+        case CMD_TYPE_CD:
+            handle_cd(client_fd, &ctx, cmd_packet->data);
+            break;
+        case CMD_TYPE_LS:
+            handle_ls(client_fd, &ctx);
+            break;
+        case CMD_TYPE_GETS:
+            // 保留 V3 客户端兼容路径。
+            // 当客户端按第四期方式发起独立传输连接时，长命令将优先经过认证分流。
+            handle_gets(client_fd, &ctx, cmd_packet->data);
+            break;
+        case CMD_TYPE_PUTS:
+            handle_puts(client_fd, &ctx, cmd_packet->data);
+            break;
+        case CMD_TYPE_TOUCH:
+            handle_touch(client_fd, &ctx, cmd_packet->data);
+            break;
+        case CMD_TYPE_RM:
+            handle_rm(client_fd, &ctx, cmd_packet->data);
+            break;
+        case CMD_TYPE_MKDIR:
+            handle_mkdir(client_fd, &ctx, cmd_packet->data);
+            break;
+        case CMD_TYPE_RMDIR:
+            handle_rmdir(client_fd, &ctx, cmd_packet->data);
+            break;
+        default:
+            send_msg(client_fd, "指令错误!");
+            break;
     }
+
+    // 第六步：把业务处理后的上下文回写到连接状态。
+    if (conn_state_sync_from_client_ctx(state, &ctx) != 0) {
+        return -1;
+    }
+
+    // 第七步：根据 user_id 同步登录标记。
+    if (state->user_id != -1) {
+        state->is_logged_in = 1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief  根据认证包和后续命令，构造一个传输任务
+ * @param  client_fd 当前客户端套接字
+ * @param  auth_packet 已接收的认证包
+ * @param  task 输出参数，用来保存最终构造的传输任务
+ * @return 成功返回 0，失败返回 -1
+ */
+int session_build_transfer_task(int client_fd, const auth_packet_t *auth_packet, transfer_task_t *task) {
+    command_packet_t cmd_packet;
+    time_t exp_time = 0;
+    char user_name[JWT_USER_NAME_LEN] = {0};
+
+    // 第一步：校验输入参数。
+    if (auth_packet == NULL || task == NULL) {
+        return -1;
+    }
+
+    // 第二步：当前传输任务只允许 gets 和 puts。
+    if (auth_packet->transfer_cmd != CMD_TYPE_GETS && auth_packet->transfer_cmd != CMD_TYPE_PUTS) {
+        return -1;
+    }
+
+    // 第三步：先把任务结构体清零。
+    memset(task, 0, sizeof(transfer_task_t));
+
+    // 第四步：校验 token，并从 token 中恢复 user_id。
+    // 用户名和过期时间在这里主要用于校验流程完整性。
+    if (jwt_verify_token(auth_packet->token,
+                         &task->ctx.user_id,
+                         user_name,
+                         sizeof(user_name),
+                         &exp_time) != 0) {
+        return -1;
+    }
+
+    // 第五步：使用认证包中的 current_path 恢复目录上下文。
+    strncpy(task->ctx.current_path, auth_packet->current_path, sizeof(task->ctx.current_path) - 1);
+    if (restore_current_dir_id(task->ctx.user_id, task->ctx.current_path, &task->ctx.current_dir_id) != 0) {
+        return -1;
+    }
+
+    // 第六步：继续接收本次传输连接上的普通命令包。
+    if (recv_command_packet(client_fd, &cmd_packet) <= 0) {
+        return -1;
+    }
+
+    // 第七步：认证包中声明的命令类型必须与后续命令包一致。
+    if (cmd_packet.cmd_type != auth_packet->transfer_cmd) {
+        return -1;
+    }
+
+    // 第八步：整理出线程池需要的传输任务内容。
+    task->client_fd = client_fd;
+    task->cmd_type = cmd_packet.cmd_type;
+    strncpy(task->arg, cmd_packet.data, sizeof(task->arg) - 1);
+    return 0;
+}
+
+/**
+ * @brief  在工作线程中处理一次传输任务
+ * @param  task 传输任务
+ * @return 无
+ */
+void session_handle_transfer_task(const transfer_task_t *task) {
+    ClientContext ctx;
+
+    // 第一步：校验任务指针。
+    if (task == NULL) {
+        return;
+    }
+
+    // 第二步：从传输任务中恢复业务层需要的 ClientContext。
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.user_id = task->ctx.user_id;
+    ctx.current_dir_id = task->ctx.current_dir_id;
+    strncpy(ctx.current_path, task->ctx.current_path, sizeof(ctx.current_path) - 1);
+
+    // 第三步：根据任务类型进入上传或下载处理流程。
+    if (task->cmd_type == CMD_TYPE_GETS) {
+        handle_gets(task->client_fd, &ctx, (char *)task->arg);
+        return;
+    }
+
+    if (task->cmd_type == CMD_TYPE_PUTS) {
+        handle_puts(task->client_fd, &ctx, (char *)task->arg);
+        return;
+    }
+
+    // 第四步：命令类型不合法时，返回统一错误消息。
+    send_msg(task->client_fd, "传输任务无效");
 }

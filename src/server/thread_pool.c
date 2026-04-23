@@ -15,54 +15,39 @@
  * @return 无
  */
 void init_thread_pool(thread_pool_t* pool,int num){
-    // exitFlag=0 表示线程池当前处于正常工作状态。
+    /* 第一步：初始化线程池的基础状态。 */
     pool->exitFlag=0;
-
-    // 记录线程总数，后面 join 和遍历时要用。
     pool->num=num;
 
-    // 初始化互斥锁，用来保护任务队列和 busy_fds。
+    /* 第二步：初始化同步工具，保护任务队列和忙碌线程记录。 */
     pthread_mutex_init(&pool->lock,NULL);
-
-    // 初始化条件变量，队列为空时，线程会睡在这里。
     pthread_cond_init(&pool->cond,NULL);
 
-    // 先把任务队列整体清零，表示初始时队列为空。
+    /* 第三步：把任务队列清零，表示线程池刚启动时没有待处理任务。 */
     memset(&pool->queue,0,sizeof(queue_t));
 
-    // 为线程 ID 数组分配空间。
-    // 后面 destroy_thread_pool 会负责统一释放。
+    /* 第四步：申请线程池运行所需的动态数组。 */
     pool->thread_id_arr=(pthread_t*)malloc(num*sizeof(pthread_t));
-
-    // 为每个线程准备一个 worker_arg_t。
-    // 这样每个线程都能知道“自己是第几个线程”。
     pool->worker_arg_arr=(worker_arg_t*)malloc(num*sizeof(worker_arg_t));
-
-    // busy_fds 用来记录每个线程当前正在处理哪个 client_fd。
     pool->busy_fds=(int*)malloc(num*sizeof(int));
 
-    // 只要有一个 malloc 失败，就直接退出。
+    /* 任意一块关键内存申请失败时，线程池都无法继续工作。 */
     if(pool->thread_id_arr==NULL || pool->worker_arg_arr==NULL || pool->busy_fds==NULL){
         LOG_ERROR("线程池内存分配失败");
         exit(1);
     }
 
-    // 初始状态下，没有线程正在处理客户端，所以全部设成 -1。
-    // 这个数组主要用于服务端退出时，定位每个工作线程当前正忙着处理哪个客户端。
+    /* 第五步：初始化忙碌连接记录，-1 表示当前线程空闲。 */
     for(int idx=0;idx<num;++idx){
         pool->busy_fds[idx]=-1;
     }
 
-    // 真正开始创建工作线程。
+    /* 第六步：依次创建所有工作线程。 */
     for(int idx=0;idx<num;++idx){
-        // 告诉当前线程：线程池是谁。
         pool->worker_arg_arr[idx].pool=pool;
-
-        // 告诉当前线程：你自己的编号是多少。
         pool->worker_arg_arr[idx].index=idx;
 
-        // pthread_create 成功返回 0，失败返回正的错误码。
-        // 所以这里不能再按 -1 判断。
+        /* 每个线程都通过 worker_arg_t 获取线程池地址和线程编号。 */
         int ret=pthread_create(&pool->thread_id_arr[idx],NULL,thread_func,(void*)&pool->worker_arg_arr[idx]);
         THREAD_ERROR_CHECK(ret,"创建工作线程");
     }
@@ -77,17 +62,17 @@ void init_thread_pool(thread_pool_t* pool,int num){
  * @return 无
  */
 void destroy_thread_pool(thread_pool_t *pool){
-    // 先做空指针保护。
+    /* 先做空指针保护。 */
     if(pool==NULL){
         return;
     }
 
-    // 下面 3 个 free 对应 init_thread_pool 里的 3 次 malloc。
+    /* 释放初始化阶段申请的动态数组。 */
     free(pool->thread_id_arr);
     free(pool->worker_arg_arr);
     free(pool->busy_fds);
 
-    // 最后销毁同步工具。
+    /* 最后销毁互斥锁和条件变量。 */
     pthread_mutex_destroy(&pool->lock);
     pthread_cond_destroy(&pool->cond);
 }

@@ -273,7 +273,7 @@ static int create_user_file_link(ClientContext *ctx, const char *full_path, cons
 }
 
 /**
- * @brief  在上传数据完整落盘后，补齐 files 表与 paths 表的数据库关系
+ * @brief  在上传数据完整写入文件后，补齐 files 表与 paths 表的数据库关系
  * @param  ctx 当前客户端会话上下文
  * @param  full_path 逻辑全路径
  * @param  file_name 最后一级文件名
@@ -486,7 +486,7 @@ void handle_puts(int client_fd, ClientContext *ctx, char *arg) {
     }
 
     if (client_file_packet.hash[0] == '\0') {
-        // 当前这套秒传/真实落盘设计是强依赖 hash 的。
+        // 当前这套秒传和真实文件设计是强依赖 hash 的。
         // 如果客户端没传 hash，那么：
         // 1. 无法秒传判断
         // 2. 无法定位真实文件名
@@ -543,7 +543,7 @@ void handle_puts(int client_fd, ClientContext *ctx, char *arg) {
     }
 
     // ==============================
-    // 第二种情况：sha256 不存在，正常落盘
+    // 第二种情况：sha256 不存在，正常写入文件
     // ==============================
     if (build_store_file_path(real_path, sizeof(real_path), client_file_packet.hash) != 0) {
         LOG_ERROR("拼接上传真实文件路径失败，客户端fd=%d，hash=%s", client_fd, client_file_packet.hash);

@@ -57,7 +57,7 @@ static void hash_password_with_salt(const char *password,const char*salt,char*ou
     unsigned char hash[SHA256_DIGEST_LENGTH];
 
     // 这里直接把“密码 + 盐值”拼起来再做 SHA-256。
-    // 这样即使两个用户密码相同，只要盐值不同，最终落库的哈希也会不同。
+    // 这样即使两个用户密码相同，只要盐值不同，最终写入数据库的哈希也会不同。
     snprintf(salted_password, sizeof(salted_password), "%s%s", password, salt);
     SHA256((unsigned char*)salted_password, strlen(salted_password), hash);
     bin_to_hex(hash, output, SHA256_DIGEST_LENGTH);
@@ -82,7 +82,7 @@ void handle_register(int client_fd,const char*data,int *user_id){
         return;
     }
 
-    // 第一步：为新用户生成盐值，并把“密码 + 盐值”转换成最终要落库的哈希。
+    // 第一步：为新用户生成盐值，并把“密码 + 盐值”转换成最终写入数据库的哈希。
     char salt[33];
     char password_hash[65];
     generate_salt(salt);

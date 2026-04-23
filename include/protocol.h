@@ -10,6 +10,10 @@
 // 文件名也统一使用固定长度数组。
 #define FILE_NAME_LEN 256
 
+// JWT 字符串统一使用固定长度数组。
+// 当前项目里 token 内容不会特别长，512 对当前阶段足够。
+#define TOKEN_LEN 512
+
 // paths.file_name 在数据库中的上限是 30。
 // 客户端和服务端共用这个限制，避免运行到 SQL 插入阶段才暴露错误。
 #define MAX_VFS_NAME_LEN 30
@@ -42,6 +46,8 @@ typedef enum {
     CMD_TYPE_REPLY,       // 服务端返回的普通文本响应
     CMD_TYPE_LOGIN,       // 登录命令
     CMD_TYPE_REGISTER,    // 注册命令
+    CMD_TYPE_AUTH,        // 传输连接认证命令
+    CMD_TYPE_TOKEN,       // 服务端返回 token 的命令
 } cmd_type_t;
 
 // 普通命令结构体。
@@ -65,6 +71,26 @@ typedef struct {
     char file_name[FILE_NAME_LEN]; // 文件名
     char hash[65];                 // 文件内容的 sha256 哈希值，64 字节 + 1 字节 '\0'
 } file_packet_t;
+
+// 传输连接认证结构体。
+// 客户端在发起独立上传/下载连接时，先发送这个结构体。
+// 服务端主线程校验 token 成功后，再决定是否把该连接交给工作线程。
+typedef struct {
+    int cmd_type;                      // 固定为 CMD_TYPE_AUTH
+    int transfer_cmd;                  // 本次真实要执行的命令，通常是 puts 或 gets
+    int data_len;                      // current_path 中有效字符串长度
+    char current_path[CMD_DATA_LEN];   // 客户端主连接当前所在虚拟路径
+    char token[TOKEN_LEN];             // 登录成功后服务端签发的 token
+} auth_packet_t;
+
+// token 返回结构体。
+// 登录成功后，服务端会额外发送这个结构体给客户端保存。
+typedef struct {
+    int cmd_type;                  // 固定为 CMD_TYPE_TOKEN
+    int is_ok;                     // 1 表示有有效 token，0 表示没有
+    int data_len;                  // token 中有效字符串长度
+    char token[TOKEN_LEN];         // token 正文
+} token_packet_t;
 
 /**
  * @brief  把命令字符串转换成命令枚举值
@@ -143,5 +169,56 @@ int send_file_packet(int fd, const file_packet_t *packet);
  * @return 成功时返回接收字节数，失败返回 <= 0 或 -1
  */
 int recv_file_packet(int fd, file_packet_t *packet);
+
+/**
+ * @brief  初始化传输连接认证结构体
+ * @param  packet 要被填写的结构体地址
+ * @param  transfer_cmd 本次真实要执行的命令类型
+ * @param  current_path 当前虚拟路径
+ * @param  token token 字符串
+ * @return 无
+ */
+void init_auth_packet(auth_packet_t *packet, cmd_type_t transfer_cmd, const char *current_path, const char *token);
+
+/**
+ * @brief  发送一个完整的传输连接认证结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 要发送的结构体地址
+ * @return 成功返回 0，失败返回 -1
+ */
+int send_auth_packet(int fd, const auth_packet_t *packet);
+
+/**
+ * @brief  接收一个完整的传输连接认证结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 用于保存结果的结构体地址
+ * @return 成功时返回接收字节数，失败返回 <= 0 或 -1
+ */
+int recv_auth_packet(int fd, auth_packet_t *packet);
+
+/**
+ * @brief  初始化 token 返回结构体
+ * @param  packet 要被填写的结构体地址
+ * @param  token token 字符串，可以传 NULL
+ * @param  is_ok 是否有效，1 表示有效，0 表示无效
+ * @return 无
+ */
+void init_token_packet(token_packet_t *packet, const char *token, int is_ok);
+
+/**
+ * @brief  发送一个完整的 token 返回结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 要发送的结构体地址
+ * @return 成功返回 0，失败返回 -1
+ */
+int send_token_packet(int fd, const token_packet_t *packet);
+
+/**
+ * @brief  接收一个完整的 token 返回结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 用于保存结果的结构体地址
+ * @return 成功时返回接收字节数，失败返回 <= 0 或 -1
+ */
+int recv_token_packet(int fd, token_packet_t *packet);
 
 #endif
