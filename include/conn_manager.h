@@ -4,19 +4,21 @@
 #include <time.h>
 #include "protocol.h"
 
+/* 单个主连接在服务端维护的状态信息。 */
 typedef struct ServerConnState {
-    int fd;
-    int is_logged_in;
-    int user_id;
-    int current_dir_id;
-    int wheel_slot;
-    unsigned long long expire_tick;
-    time_t last_active_time;
-    char current_path[CMD_DATA_LEN];
-    char token[TOKEN_LEN];
-    struct ServerConnState *next;
+    int fd;                             /* 当前连接 fd */
+    int is_logged_in;                   /* 是否已登录 */
+    int user_id;                        /* 当前连接对应的用户 ID */
+    int current_dir_id;                 /* 当前目录节点 ID */
+    int wheel_slot;                     /* 当前挂入的时间轮槽位 */
+    unsigned long long expire_tick;     /* 当前记录的过期 tick */
+    time_t last_active_time;            /* 最近一次活跃时间 */
+    char current_path[CMD_DATA_LEN];    /* 当前虚拟路径 */
+    char token[TOKEN_LEN];              /* 当前连接保存的 token */
+    struct ServerConnState *next;       /* 单链表后继指针 */
 } ServerConnState;
 
+/* 连接状态管理器，当前版本使用单链表保存所有主连接状态。 */
 typedef struct {
     ServerConnState *head;
 } ConnManager;

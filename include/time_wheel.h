@@ -3,17 +3,20 @@
 
 #include "conn_manager.h"
 
+/* 单个时间轮结点，对应一个连接的一次超时记录。 */
 typedef struct TimeWheelNode {
     int fd;
     unsigned long long expire_tick;
     struct TimeWheelNode *next;
 } TimeWheelNode;
 
+/* 单个槽位中的链表头尾指针。 */
 typedef struct {
     TimeWheelNode *head;
     TimeWheelNode *tail;
 } TimeWheelSlot;
 
+/* 简单循环时间轮结构。 */
 typedef struct {
     int slot_count;
     int timeout_seconds;

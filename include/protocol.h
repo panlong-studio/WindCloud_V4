@@ -3,35 +3,27 @@
 
 #include <sys/types.h>
 
-// 普通命令参数统一使用固定长度数组。
-// 这样做的好处是协议大小固定，客户端和服务端都容易收发。
+/* 普通命令参数统一使用固定长度数组，便于双方按固定结构体长度收发。 */
 #define CMD_DATA_LEN 256
 
-// 文件名也统一使用固定长度数组。
+/* 文件名同样使用固定长度数组，避免协议层出现动态长度处理。 */
 #define FILE_NAME_LEN 256
 
-// JWT 字符串统一使用固定长度数组。
-// 当前项目里 token 内容不会特别长，512 对当前阶段足够。
+/* token 字符串长度上限。当前第四期实现中，512 字节已经足够。 */
 #define TOKEN_LEN 512
 
-// paths.file_name 在数据库中的上限是 30。
-// 客户端和服务端共用这个限制，避免运行到 SQL 插入阶段才暴露错误。
+/* 虚拟文件系统中单个名字的长度上限，客户端和服务端共用这套限制。 */
 #define MAX_VFS_NAME_LEN 30
 
-// 用户会话上下文。
-// 一个客户端连接对应一份独立的会话状态，
-// 后续目录切换、上传下载都依赖这里保存的上下文信息。
+/* 用户会话上下文，目录切换和文件传输都依赖这里保存的状态。 */
 typedef struct{
-    int user_id;//用户 ID，登录后才有值
-    char current_path[256];//当前虚拟路径
-    int current_dir_id;//当前所在目录的节点 ID，根目录约定为 0
+    int user_id;                 /* 用户 ID，登录成功后才有有效值 */
+    char current_path[256];      /* 当前虚拟路径 */
+    int current_dir_id;          /* 当前目录节点 ID，根目录约定为 0 */
 }ClientContext;
 
 
-// 命令类型枚举。
-// 客户端发命令时写入这个编号。
-// 服务端收命令时读取这个编号。
-// 这样双方不需要每次都重复传完整字符串去判断命令。
+/* 命令类型枚举，客户端和服务端通过该编号区分具体命令。 */
 typedef enum {
     CMD_TYPE_INVALID = 0, // 非法命令，或者暂时无法识别的命令
     CMD_TYPE_PWD,         // 查看当前虚拟路径
@@ -50,19 +42,14 @@ typedef enum {
     CMD_TYPE_TOKEN,       // 服务端返回 token 的命令
 } cmd_type_t;
 
-// 普通命令结构体。
-// 这个结构体负责传输：
-// 1. 普通命令的参数
-// 2. 服务端返回的文本消息
+/* 普通命令结构体，既用于发送普通命令，也用于返回文本响应。 */
 typedef struct {
     int cmd_type;              // 命令类型，对应上面的 cmd_type_t
     int data_len;              // data 里真正有效的字符串长度
     char data[CMD_DATA_LEN];   // 命令参数，或者普通文本响应
 } command_packet_t;
 
-// 文件传输结构体。
-// 上传和下载都需要知道文件名、总大小、断点位置。
-// 所以把这些字段统一放进一个结构体里，双方协议就统一了。
+/* 文件传输结构体，上传和下载共用这一套元数据。 */
 typedef struct {
     int cmd_type;                  // 当前是 puts 还是 gets
     int data_len;                  // file_name 中有效的字符串长度
@@ -72,9 +59,7 @@ typedef struct {
     char hash[65];                 // 文件内容的 sha256 哈希值，64 字节 + 1 字节 '\0'
 } file_packet_t;
 
-// 传输连接认证结构体。
-// 客户端在发起独立上传/下载连接时，先发送这个结构体。
-// 服务端主线程校验 token 成功后，再决定是否把该连接交给工作线程。
+/* 传输连接认证结构体，独立传输连接建立后首先发送这一包。 */
 typedef struct {
     int cmd_type;                      // 固定为 CMD_TYPE_AUTH
     int transfer_cmd;                  // 本次真实要执行的命令，通常是 puts 或 gets
@@ -83,8 +68,7 @@ typedef struct {
     char token[TOKEN_LEN];             // 登录成功后服务端签发的 token
 } auth_packet_t;
 
-// token 返回结构体。
-// 登录成功后，服务端会额外发送这个结构体给客户端保存。
+/* token 返回结构体，登录成功后服务端会额外发送给客户端保存。 */
 typedef struct {
     int cmd_type;                  // 固定为 CMD_TYPE_TOKEN
     int is_ok;                     // 1 表示有有效 token，0 表示没有

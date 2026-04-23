@@ -140,23 +140,23 @@ int session_handle_main_command(int client_fd, ServerConnState *state, command_p
             char user_name[JWT_USER_NAME_LEN] = {0};
             char token[TOKEN_LEN] = {0};
 
-            // 登录时先从原始参数中提取用户名，随后执行密码校验。
+            /* 登录阶段先提取用户名，再执行账号密码校验。 */
             parse_login_user_name(cmd_packet->data, user_name, sizeof(user_name));
             handle_login(client_fd, cmd_packet->data, &ctx.user_id);
 
-            // 只有“之前未登录、现在登录成功”时，才初始化根目录状态并签发 token。
+            /* 只有“之前未登录、现在登录成功”时，才初始化目录状态并签发 token。 */
             if (old_user_id == -1 && ctx.user_id != -1) {
                 strcpy(ctx.current_path, "/");
                 ctx.current_dir_id = 0;
 
-                // 生成 token 成功时，把 token 保存到连接状态，并发送给客户端。
+                /* token 生成成功时，把 token 保存到连接状态，并发送给客户端。 */
                 if (jwt_create_token(ctx.user_id, user_name, JWT_EXPIRE_SECONDS, token, sizeof(token)) == 0) {
                     strncpy(state->token, token, sizeof(state->token) - 1);
                     token_packet_t token_packet;
                     init_token_packet(&token_packet, state->token, 1);
                     send_token_packet(client_fd, &token_packet);
                 } else {
-                    // token 生成失败时，仍然返回一个无效 token 包，便于客户端明确识别异常。
+                    /* token 生成失败时，仍然返回一个无效 token 包，便于客户端识别异常。 */
                     token_packet_t token_packet;
                     state->token[0] = '\0';
                     init_token_packet(&token_packet, NULL, 0);
@@ -168,6 +168,7 @@ int session_handle_main_command(int client_fd, ServerConnState *state, command_p
 
         case CMD_TYPE_REGISTER: {
             int temp_new_id = -1;
+            /* 注册命令直接复用现有注册处理逻辑。 */
             handle_register(client_fd, cmd_packet->data, &temp_new_id);
             break;
         }
@@ -182,8 +183,7 @@ int session_handle_main_command(int client_fd, ServerConnState *state, command_p
             handle_ls(client_fd, &ctx);
             break;
         case CMD_TYPE_GETS:
-            // 保留 V3 客户端兼容路径。
-            // 当客户端按第四期方式发起独立传输连接时，长命令将优先经过认证分流。
+            /* 保留 V3 客户端兼容路径。第四期独立传输连接会优先经过认证分流。 */
             handle_gets(client_fd, &ctx, cmd_packet->data);
             break;
         case CMD_TYPE_PUTS:
@@ -211,7 +211,7 @@ int session_handle_main_command(int client_fd, ServerConnState *state, command_p
         return -1;
     }
 
-    // 第七步：根据 user_id 同步登录标记。
+    /* 第七步：根据 user_id 同步登录标记。 */
     if (state->user_id != -1) {
         state->is_logged_in = 1;
     }
@@ -244,8 +244,8 @@ int session_build_transfer_task(int client_fd, const auth_packet_t *auth_packet,
     // 第三步：先把任务结构体清零。
     memset(task, 0, sizeof(transfer_task_t));
 
-    // 第四步：校验 token，并从 token 中恢复 user_id。
-    // 用户名和过期时间在这里主要用于校验流程完整性。
+    /* 第四步：校验 token，并从 token 中恢复 user_id。 */
+    /* 用户名和过期时间在这里主要用于保证校验流程完整。 */
     if (jwt_verify_token(auth_packet->token,
                          &task->ctx.user_id,
                          user_name,
@@ -254,23 +254,23 @@ int session_build_transfer_task(int client_fd, const auth_packet_t *auth_packet,
         return -1;
     }
 
-    // 第五步：使用认证包中的 current_path 恢复目录上下文。
+    /* 第五步：使用认证包中的 current_path 恢复目录上下文。 */
     strncpy(task->ctx.current_path, auth_packet->current_path, sizeof(task->ctx.current_path) - 1);
     if (restore_current_dir_id(task->ctx.user_id, task->ctx.current_path, &task->ctx.current_dir_id) != 0) {
         return -1;
     }
 
-    // 第六步：继续接收本次传输连接上的普通命令包。
+    /* 第六步：继续接收本次传输连接上的普通命令包。 */
     if (recv_command_packet(client_fd, &cmd_packet) <= 0) {
         return -1;
     }
 
-    // 第七步：认证包中声明的命令类型必须与后续命令包一致。
+    /* 第七步：认证包中声明的命令类型必须与后续命令包一致。 */
     if (cmd_packet.cmd_type != auth_packet->transfer_cmd) {
         return -1;
     }
 
-    // 第八步：整理出线程池需要的传输任务内容。
+    /* 第八步：整理出线程池需要的传输任务内容。 */
     task->client_fd = client_fd;
     task->cmd_type = cmd_packet.cmd_type;
     strncpy(task->arg, cmd_packet.data, sizeof(task->arg) - 1);
@@ -296,7 +296,7 @@ void session_handle_transfer_task(const transfer_task_t *task) {
     ctx.current_dir_id = task->ctx.current_dir_id;
     strncpy(ctx.current_path, task->ctx.current_path, sizeof(ctx.current_path) - 1);
 
-    // 第三步：根据任务类型进入上传或下载处理流程。
+    /* 第三步：根据任务类型进入上传或下载处理流程。 */
     if (task->cmd_type == CMD_TYPE_GETS) {
         handle_gets(task->client_fd, &ctx, (char *)task->arg);
         return;
@@ -307,6 +307,6 @@ void session_handle_transfer_task(const transfer_task_t *task) {
         return;
     }
 
-    // 第四步：命令类型不合法时，返回统一错误消息。
+    /* 第四步：命令类型不合法时，返回统一错误消息。 */
     send_msg(task->client_fd, "传输任务无效");
 }

@@ -15,7 +15,7 @@
  */
 int dao_get_node_by_path(int user_id, const char *path, int *out_id, int *out_type) {
     // 根目录 "/" 是一个特殊情况。
-    // 当前项目没有把每个用户的根目录真的插到 paths 表中，
+    // 当前项目没有把每个用户的根目录单独写入 paths 表，
     // 所以这里约定：
     // 1. 根目录的 id 当作 0
     // 2. 根目录一定是目录，所以 type=1
