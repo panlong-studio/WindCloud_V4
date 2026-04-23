@@ -1,34 +1,24 @@
-# Prerequisites
+# =================================================
+# 1. 编译产物 (C 语言基础)
+# =================================================
 *.d
-
-# Object files
 *.o
 *.ko
 *.obj
 *.elf
-
-# Linker output
 *.ilk
 *.map
 *.exp
-
-# Precompiled Headers
 *.gch
 *.pch
-
-# Libraries
 *.lib
 *.a
 *.la
 *.lo
-
-# Shared objects (inc. Windows DLLs)
 *.dll
 *.so
 *.so.*
 *.dylib
-
-# Executables
 *.exe
 *.out
 *.app
@@ -36,13 +26,13 @@
 *.x86_64
 *.hex
 
-# Debug files
+# =================================================
+# 2. 调试与系统文件
+# =================================================
 *.dSYM/
 *.su
 *.idb
 *.pdb
-
-# Kernel Module Compile Results
 *.mod*
 *.cmd
 .tmp_versions/
@@ -50,6 +40,44 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
-
-# debug information files
 *.dwo
+.DS_Store
+Thumbs.db
+
+# =================================================
+# 3. VS Code Remote-SSH 专属 (非常重要)
+# =================================================
+.vscode/
+.history/
+*.code-workspace
+*.swp
+*.swo
+*.codex
+.codex
+
+# =================================================
+# 4. 构建工具 (Makefile/CMake)
+# =================================================
+build/
+config/
+bin/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# =================================================
+# 5. 云存储项目业务相关 (防止测试数据污染仓库)
+# =================================================
+# 假设上传文件存放在这些目录，需确保名字对应
+
+# 日志与数据库
+*.log
+*.db
+*.db-journal
+
+# 忽略所有程序运行生成的日志和临时文本
+log/*.log
+
+# 忽略专门存放测试素材的目录
+test/
+test/tmp/
