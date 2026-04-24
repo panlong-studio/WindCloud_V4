@@ -87,8 +87,8 @@ int init_db_pool(const char* host,const char*user,const char*pwd,
             return -1;
         }
 
-        // 开启自动重连机制这一版暂时没有打开，避免和当前教学代码的行为不一致。
-        // 如果后续要增强稳定性，可以再评估是否启用 MYSQL_OPT_RECONNECT。
+        // 当前实现没有主动启用 MySQL 自动重连选项。
+        // 如果后续需要增强数据库连接中断后的恢复能力，可以再评估是否启用 MYSQL_OPT_RECONNECT。
 
         // 真正连接到目标数据库。
         if(mysql_real_connect(conn,host,user,pwd,db_name,0,NULL,0)==NULL){
