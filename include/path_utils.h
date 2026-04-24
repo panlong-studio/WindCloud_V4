@@ -1,7 +1,9 @@
 #ifndef _PATH_UTILS_H_
 #define _PATH_UTILS_H_
 
-#define SERVER_BASE_DIR "../test"
+/* 服务端真实文件目录的默认相对路径。 */
+#define SERVER_BASE_DIR "../test/server_files"
+/* 项目里统一使用的路径缓冲区大小。 */
 #define MAX_PATH_LEN 1024
 
 /**

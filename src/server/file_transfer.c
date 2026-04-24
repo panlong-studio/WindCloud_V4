@@ -18,28 +18,26 @@
 #include "log.h"
 
 #define BUFFER_SIZE 4096
-#define FILE_STORE_DIR_NAME "files"
-
 /**
  * @brief  获取服务端真实文件仓库的根目录
  * @return 成功时返回可用的根目录字符串，失败时退回默认 SERVER_BASE_DIR
  */
 static const char *get_server_base_dir(void) {
     /* 工程可能从项目根目录启动，也可能从 bin 目录启动。 */
-    /* 这里优先探测当前运行环境里真实存在的目录，避免后续拼路径时写到错误位置。 */
+    /* 这里优先探测当前运行环境里真实存在的 server_files 目录。 */
     if (access(SERVER_BASE_DIR, F_OK) == 0) {
         return SERVER_BASE_DIR;
     }
 
-    if (access("./test", F_OK) == 0) {
-        return "./test";
+    if (access("./test/server_files", F_OK) == 0) {
+        return "./test/server_files";
     }
 
     return SERVER_BASE_DIR;
 }
 
 /**
- * @brief  确保真实文件仓库目录 test/files 存在
+ * @brief  确保真实文件仓库目录 test/server_files 存在
  * @param  store_dir 输出参数，用来保存最终可用的真实文件仓库路径
  * @param  size store_dir 缓冲区大小
  * @return 成功返回 0，失败返回 -1
@@ -48,8 +46,8 @@ static int ensure_store_dir(char *store_dir, int size) {
     struct stat st;
     const char *base_dir = get_server_base_dir();
 
-    /* 第一步：拼接真实文件仓库目录 test/files。 */
-    if (snprintf(store_dir, size, "%s/%s", base_dir, FILE_STORE_DIR_NAME) >= size) {
+    /* 第一步：记录最终真实文件仓库目录。 */
+    if (snprintf(store_dir, size, "%s", base_dir) >= size) {
         return -1;
     }
 
@@ -203,7 +201,7 @@ static int check_store_file_ready(const char *sha256sum, off_t expected_size, of
     // 先默认成 0，避免调用方在失败分支读到未初始化值。
     *local_size = 0;
 
-    // 第一步：先把 test/files/<sha256> 的真实路径拼出来。
+    // 第一步：先把 test/server_files/<sha256> 的真实路径拼出来。
     // 如果连路径都无法构造，说明服务端存储环境本身就有问题。
     if (build_store_file_path(real_path, sizeof(real_path), sha256sum) != 0) {
         return -1;

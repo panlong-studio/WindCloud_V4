@@ -3,22 +3,36 @@
 
 #include <mysql/mysql.h>
 
-//初始化数据库连接池
-// 参数：host, user, pwd, db_name, pool_size(预先创建几个连接，比如 10 个)
-// 返回：0 成功，-1 失败
+/**
+ * @brief  初始化数据库连接池
+ * @param  host MySQL 主机地址
+ * @param  user MySQL 用户名
+ * @param  pwd MySQL 密码
+ * @param  db_name 数据库名
+ * @param  pool_size 连接池大小，也就是预先创建多少条数据库连接
+ * @return 成功返回 0，失败返回 -1
+ */
 int init_db_pool(const char* host,const char* user,const char* pwd,
                  const char* db_name, int pool_size);
 
-//销毁连接池（服务端退出时调用）
+/**
+ * @brief  销毁数据库连接池，并关闭池中的全部连接
+ * @return 无
+ */
 void destroy_db_pool();
 
-//=========业务接口========
-//执行增删改（insert, update, delete）
-//返回：0 成功，-1 失败
+/**
+ * @brief  执行一条增删改 SQL
+ * @param  sql 要执行的 SQL 语句
+ * @return 成功返回 0，失败返回 -1
+ */
 int db_execute_update(const char* sql);
 
-//执行查询（select）
-//返回：查询结果集指针，失败返回 NULL
+/**
+ * @brief  执行一条查询 SQL，并返回结果集
+ * @param  sql 要执行的查询 SQL
+ * @return 成功返回结果集指针，失败返回 NULL
+ */
 MYSQL_RES* db_execute_query(const char* sql);
 
 #endif

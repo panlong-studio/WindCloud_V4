@@ -13,14 +13,100 @@
 #include "log.h"
 
 #define BUFFER_SIZE 4096
+#define CLIENT_BASE_DIR "../test/client_files"
+#define CLIENT_MAX_PATH_LEN 1024
 
+/**
+ * @brief  后台下载线程使用的参数集合
+ * @param  arg 本次下载的文件名
+ * @param  current_path 客户端主连接当前所在的逻辑路径
+ * @param  token 登录成功后主连接保存的 JWT
+ * @param  server_ip 服务端 IP，供独立传输线程重新建连
+ * @param  server_port 服务端端口，供独立传输线程重新建连
+ * @return 无
+ */
 typedef struct {
-    char arg[FILE_NAME_LEN];
-    char current_path[CMD_DATA_LEN];
-    char token[TOKEN_LEN];
-    char server_ip[64];
-    char server_port[32];
+    char arg[FILE_NAME_LEN];         /* 本次下载的文件名 */
+    char current_path[CMD_DATA_LEN]; /* 当前逻辑路径，服务端据此恢复 current_dir_id */
+    char token[TOKEN_LEN];           /* 登录成功后拿到的 token */
+    char server_ip[64];              /* 服务端 IP */
+    char server_port[32];            /* 服务端端口 */
 } ClientTransferArgs;
+
+/**
+ * @brief  获取客户端本地测试文件目录
+ * @return 成功时返回可用目录字符串，失败时退回默认 CLIENT_BASE_DIR
+ */
+static const char *get_client_base_dir(void) {
+    /* 第一步：优先尝试“从 bin 目录启动”时能直接访问到的默认路径。 */
+    if (access(CLIENT_BASE_DIR, F_OK) == 0) {
+        return CLIENT_BASE_DIR;
+    }
+
+    /* 第二步：如果程序从项目根目录启动，则使用 ./test/client_files。 */
+    if (access("./test/client_files", F_OK) == 0) {
+        return "./test/client_files";
+    }
+
+    /* 第三步：两种启动方式都没有探测成功时，退回默认相对路径。 */
+    return CLIENT_BASE_DIR;
+}
+
+/**
+ * @brief  确保客户端本地测试文件目录存在
+ * @param  base_dir 输出参数，用来保存最终目录路径
+ * @param  size base_dir 缓冲区大小
+ * @return 成功返回 0，失败返回 -1
+ */
+static int ensure_client_base_dir(char *base_dir, size_t size) {
+    struct stat st;
+    const char *dir = get_client_base_dir();
+
+    /* 第一步：把最终选中的客户端本地测试目录复制到输出缓冲区。 */
+    if (snprintf(base_dir, size, "%s", dir) >= (int)size) {
+        return -1;
+    }
+
+    /* 第二步：目录已经存在时，确认它确实是一个目录。 */
+    if (stat(base_dir, &st) == 0) {
+        return S_ISDIR(st.st_mode) ? 0 : -1;
+    }
+
+    /* 第三步：目录不存在时，现场创建它。 */
+    if (mkdir(base_dir, 0777) == -1 && errno != EEXIST) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief  根据文件名拼接客户端本地文件完整路径
+ * @param  full_path 输出参数，用来保存最终完整路径
+ * @param  size full_path 缓冲区大小
+ * @param  file_name 文件名
+ * @return 成功返回 0，失败返回 -1
+ */
+static int build_client_file_path(char *full_path, size_t size, const char *file_name) {
+    char base_dir[CLIENT_MAX_PATH_LEN] = {0};
+
+    /* 第一步：文件名为空时，无法继续拼接本地路径。 */
+    if (file_name == NULL) {
+        return -1;
+    }
+
+    /* 第二步：先保证客户端本地测试目录可用。 */
+    if (ensure_client_base_dir(base_dir, sizeof(base_dir)) != 0) {
+        return -1;
+    }
+
+    /* 第三步：把“目录 + 文件名”拼成最终的本地完整路径。 */
+    if (snprintf(full_path, size, "%s/%s", base_dir, file_name) >= (int)size) {
+        return -1;
+    }
+
+    return 0;
+}
 
 /**
  * @brief  保证把一段数据完整写入本地文件
@@ -58,6 +144,7 @@ static int run_gets_transfer(int sock_fd, const char *arg) {
     off_t request_offset = 0;
     int local_file_exists = 0;
     int fd = -1;
+    char local_path[CLIENT_MAX_PATH_LEN] = {0};
     char buf[BUFFER_SIZE];
 
     /* 第一步：发送 gets 命令，让服务端进入下载流程。 */
@@ -82,8 +169,13 @@ static int run_gets_transfer(int sock_fd, const char *arg) {
         return 0;
     }
 
-    /* 第三步：检查本地是否已存在同名文件，用于决定续传位置。 */
-    if (stat(arg, &st) == 0) {
+    /* 第三步：拼接客户端本地路径，并检查是否已存在同名文件。 */
+    if (build_client_file_path(local_path, sizeof(local_path), arg) != 0) {
+        printf("拼接本地文件路径失败\n");
+        return -1;
+    }
+
+    if (stat(local_path, &st) == 0) {
         local_size = st.st_size;
         local_file_exists = 1;
     }
@@ -121,10 +213,10 @@ static int run_gets_transfer(int sock_fd, const char *arg) {
     }
 
     /* 第五步：打开或创建本地文件，准备写入下载数据。 */
-    fd = open(arg, O_WRONLY | O_CREAT, 0666);
+    fd = open(local_path, O_WRONLY | O_CREAT, 0666);
     if (fd == -1) {
         perror("创建文件失败");
-        LOG_ERROR("创建本地文件失败，文件=%s，错误码=%d", arg, errno);
+        LOG_ERROR("创建本地文件失败，文件=%s，本地路径=%s，错误码=%d", arg, local_path, errno);
         return -1;
     }
 
@@ -132,7 +224,7 @@ static int run_gets_transfer(int sock_fd, const char *arg) {
     if (request_offset == 0) {
         if (ftruncate(fd, 0) == -1) {
             perror("清空旧文件失败");
-            LOG_ERROR("截断本地文件失败，文件=%s，错误码=%d", arg, errno);
+            LOG_ERROR("截断本地文件失败，文件=%s，本地路径=%s，错误码=%d", arg, local_path, errno);
             close(fd);
             return -1;
         }
@@ -141,8 +233,9 @@ static int run_gets_transfer(int sock_fd, const char *arg) {
     /* 第六步：把文件指针移动到本次续传应该开始写入的位置。 */
     if (lseek(fd, request_offset, SEEK_SET) == -1) {
         perror("移动文件指针失败");
-        LOG_ERROR("定位本地文件失败，文件=%s，偏移=%lld，错误码=%d",
+        LOG_ERROR("定位本地文件失败，文件=%s，本地路径=%s，偏移=%lld，错误码=%d",
                   arg,
+                  local_path,
                   (long long)request_offset,
                   errno);
         close(fd);
@@ -171,7 +264,7 @@ static int run_gets_transfer(int sock_fd, const char *arg) {
         /* 把刚收到的数据完整写入本地文件。 */
         if (write_file_full(fd, buf, once) == -1) {
             perror("写入本地文件失败");
-            LOG_ERROR("写入本地文件失败，文件=%s，错误码=%d", arg, errno);
+            LOG_ERROR("写入本地文件失败，文件=%s，本地路径=%s，错误码=%d", arg, local_path, errno);
             close(fd);
             return -1;
         }
@@ -196,6 +289,7 @@ static void *gets_thread_func(void *arg) {
     int sock_fd = -1;
     auth_packet_t auth_packet;
 
+    /* 线程参数为空时，当前线程无法继续工作。 */
     if (transfer_args == NULL) {
         return NULL;
     }
@@ -236,6 +330,7 @@ int handle_gets_command(ClientAppContext *ctx, const char *arg) {
         return -1;
     }
 
+    /* 客户端只有在主连接已经登录、并且保存了 token 时才允许启动长命令。 */
     if (!ctx->is_logged_in || ctx->token[0] == '\0') {
         printf("请先登录后再下载文件。\n");
         return -1;

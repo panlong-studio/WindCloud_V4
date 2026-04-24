@@ -59,7 +59,6 @@ Thumbs.db
 # 4. 构建工具 (Makefile/CMake)
 # =================================================
 build/
-config/
 bin/
 CMakeFiles/
 CMakeCache.txt

@@ -28,6 +28,13 @@ void handle_ls(int client_fd, ClientContext *ctx);
  */
 void handle_pwd(int client_fd, ClientContext *ctx);
 
+/**
+ * @brief  处理 touch 命令，在当前目录下创建普通文件节点
+ * @param  client_fd 客户端套接字
+ * @param  ctx 当前客户端会话上下文
+ * @param  arg 用户输入的文件名
+ * @return 无
+ */
 void handle_touch(int client_fd, ClientContext *ctx, char *arg);
 
 /**
@@ -48,6 +55,13 @@ void handle_rm(int client_fd, ClientContext *ctx, char *arg);
  */
 void handle_mkdir(int client_fd, ClientContext *ctx, char *arg);
 
+/**
+ * @brief  处理 rmdir 命令，删除当前目录下的空目录
+ * @param  client_fd 客户端套接字
+ * @param  ctx 当前客户端会话上下文
+ * @param  arg 用户输入的目录名
+ * @return 无
+ */
 void handle_rmdir(int client_fd, ClientContext *ctx, char *arg);
 
 #endif

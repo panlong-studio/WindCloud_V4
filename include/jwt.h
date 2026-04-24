@@ -4,9 +4,9 @@
 #include <stddef.h>
 #include <time.h>
 
-/* JWT payload 中用户名缓冲区大小。 */
+/* JWT payload 中用户名字段使用的缓冲区大小。 */
 #define JWT_USER_NAME_LEN 64
-/* JWT 签名密钥缓冲区大小。 */
+/* JWT 签名密钥字符串允许使用的最大缓冲区大小。 */
 #define JWT_SECRET_LEN 128
 
 /**

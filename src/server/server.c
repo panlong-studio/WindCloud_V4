@@ -29,7 +29,7 @@
 #include "time_wheel.h"
 
 #define SERVER_TIME_WHEEL_SIZE 60
-#define SERVER_TIME_OUT_SECONDS 30
+#define SERVER_TIME_OUT_SECONDS 120
 
 /* pipe_fd[0] 负责读，pipe_fd[1] 负责写。父进程通过管道通知子进程退出。 */
 int pipe_fd[2];
@@ -195,39 +195,48 @@ int main(){
     char db_user[64] = {0};
     char db_pwd[64] = {0};
     char db_name[64] = {0};
+    char timeout_str[32] = {0};
+    int timeout_seconds = SERVER_TIME_OUT_SECONDS;
 
     /* 第五步：读取数据库配置，缺失时使用本地默认值。 */
     load_value_or_default("db_host", db_host, sizeof(db_host), "127.0.0.1");
     load_value_or_default("db_user", db_user, sizeof(db_user), "root");
     load_value_or_default("db_pwd",  db_pwd,  sizeof(db_pwd),  "123456"); 
     load_value_or_default("db_name", db_name, sizeof(db_name), "netdisk_db");
+    load_value_or_default("timeout_seconds", timeout_str, sizeof(timeout_str), "120");
 
-    /* 第六步：按正式配置重新初始化日志。 */
+    /* 第六步：把超时配置转换成整数，非法时回退到默认值。 */
+    timeout_seconds = atoi(timeout_str);
+    if (timeout_seconds <= 0) {
+        timeout_seconds = SERVER_TIME_OUT_SECONDS;
+    }
+
+    /* 第七步：按正式配置重新初始化日志。 */
     init_log_with_fallback(log_level, log_file);
-    LOG_INFO("服务端配置加载完成，地址=%s，端口=%s", ip, port);
+    LOG_INFO("服务端配置加载完成，地址=%s，端口=%s，超时=%d秒", ip, port, timeout_seconds);
 
-    /* 第七步：初始化数据库结构。 */
+    /* 第八步：初始化数据库结构。 */
     if (init_database(db_host, db_user, db_pwd, db_name) != 0) {
         LOG_ERROR("数据库初始化失败，服务端拒绝启动");
         close_log();
         return 1;
     }
 
-    /* 第八步：初始化数据库连接池。 */
+    /* 第九步：初始化数据库连接池。 */
     if(init_db_pool(db_host, db_user, db_pwd, db_name, 10) != 0) {
         LOG_ERROR("数据库连接池初始化失败，服务端拒绝启动");
         close_log();
         return 1;
     }
 
-    /* 第九步：创建匿名管道，供父进程通知子进程退出。 */
+    /* 第十步：创建匿名管道，供父进程通知子进程退出。 */
     if (pipe(pipe_fd) != 0) {
         LOG_ERROR("创建管道失败: %s", strerror(errno));
         close_log();
         return 1;
     }
     
-    /* 第十步：创建子进程。父进程负责等待退出，子进程负责运行服务器。 */
+    /* 第十一步：创建子进程。父进程负责等待退出，子进程负责运行服务器。 */
     pid_t pid = fork();
     if (pid < 0) {
         LOG_ERROR("创建子进程失败: %s", strerror(errno));
@@ -253,7 +262,7 @@ int main(){
         LOG_WARN("设置进程组失败 errno=%d", errno);
     }
 
-    /* 第十一步：子进程继续执行真正的服务端主逻辑。 */
+    /* 第十二步：子进程继续执行真正的服务端主逻辑。 */
     /* 创建监听 socket。 */
     int listen_fd = 0;
     init_socket(&listen_fd, ip, port);
@@ -266,7 +275,7 @@ int main(){
     ConnManager conn_manager;
     TimeWheel time_wheel;
     conn_manager_init(&conn_manager);
-    if (time_wheel_init(&time_wheel, SERVER_TIME_WHEEL_SIZE, SERVER_TIME_OUT_SECONDS) != 0) {
+    if (time_wheel_init(&time_wheel, SERVER_TIME_WHEEL_SIZE, timeout_seconds) != 0) {
         LOG_ERROR("时间轮初始化失败");
         destroy_thread_pool(&pool);
         destroy_db_pool();
@@ -286,7 +295,7 @@ int main(){
 
     /* 监听 pipe_fd[0]，表示父进程通知子进程退出。 */
     add_epoll_fd(epfd, pipe_fd[0]);
-    LOG_INFO("服务端启动成功，地址=%s，端口=%s", ip, port);
+    LOG_INFO("服务端启动成功，地址=%s，端口=%s，超时=%d秒", ip, port, timeout_seconds);
 
     time_t last_tick_time = time(NULL);
 

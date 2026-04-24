@@ -3,13 +3,14 @@
 
 #include "protocol.h"
 
+/* 客户端主线程长期维护的运行时上下文。 */
 typedef struct {
-    int sock_fd;
-    int is_logged_in;
-    char current_path[CMD_DATA_LEN];
-    char token[TOKEN_LEN];
-    char server_ip[64];
-    char server_port[32];
+    int sock_fd;                     /* 主连接 fd */
+    int is_logged_in;                /* 当前是否已经完成登录 */
+    char current_path[CMD_DATA_LEN]; /* 当前逻辑路径，cd 成功后会同步更新 */
+    char token[TOKEN_LEN];           /* 登录成功后服务端下发的 token */
+    char server_ip[64];              /* 服务端 IP，重连和长命令线程都会复用 */
+    char server_port[32];            /* 服务端端口，重连和长命令线程都会复用 */
 } ClientAppContext;
 
 /**

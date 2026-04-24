@@ -9,12 +9,12 @@
  */
 static const char *get_server_base_dir(void) {
     // 项目既可能从根目录启动，也可能从 bin 目录启动。
-    // 这里根据实际存在的路径动态选择，避免真实路径拼接错误。
+    // 这里根据实际存在的 server_files 目录动态选择，避免真实路径拼接错误。
     if (access(SERVER_BASE_DIR, F_OK) == 0) {
         return SERVER_BASE_DIR;
     }
-    if (access("./test", F_OK) == 0) {
-        return "./test";
+    if (access("./test/server_files", F_OK) == 0) {
+        return "./test/server_files";
     }
     return SERVER_BASE_DIR;
 }

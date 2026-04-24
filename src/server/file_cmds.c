@@ -14,8 +14,6 @@
 #include "path_utils.h"
 
 #define EMPTY_FILE_SHA256 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-#define FILE_STORE_DIR_NAME "files"
-
 /**
  * @brief  根据当前逻辑路径和用户参数拼接逻辑全路径
  * @param  current_path 当前会话所在逻辑路径
@@ -95,18 +93,18 @@ static int is_valid_vfs_name(const char *file_name) {
  */
 static const char *get_server_base_dir(void) {
     // 服务端既可能从项目根目录启动，也可能从 bin 目录启动。
-    // 这里动态探测真实存在的 test 目录，避免后续把真实文件落到错误位置。
+    // 这里动态探测真实存在的 server_files 目录，避免后续把真实文件落到错误位置。
     if (access(SERVER_BASE_DIR, F_OK) == 0) {
         return SERVER_BASE_DIR;
     }
-    if (access("./test", F_OK) == 0) {
-        return "./test";
+    if (access("./test/server_files", F_OK) == 0) {
+        return "./test/server_files";
     }
     return SERVER_BASE_DIR;
 }
 
 /**
- * @brief  确保真实文件仓库目录 test/files 存在
+ * @brief  确保真实文件仓库目录 test/server_files 存在
  * @param  store_dir 输出参数，用来保存最终真实文件仓库路径
  * @param  size store_dir 缓冲区大小
  * @return 成功返回 0，失败返回 -1
@@ -117,7 +115,7 @@ static int ensure_store_dir(char *store_dir, int size) {
 
     // 这个目录保存的是“真实文件实体”，而不是用户可见的逻辑目录结构。
     // paths 表中的目录树和这里完全解耦。
-    if (snprintf(store_dir, size, "%s/%s", base_dir, FILE_STORE_DIR_NAME) >= size) {
+    if (snprintf(store_dir, size, "%s", base_dir) >= size) {
         return -1;
     }
 
@@ -165,7 +163,7 @@ static int release_file_entity_if_unused(int file_id) {
     char real_path[MAX_PATH_LEN] = {0};
 
     // 第一步：先取出真实文件 hash。
-    // 删除逻辑节点后，如果引用计数归零，服务端就需要根据这个 hash 去定位 test/files/<sha256>。
+    // 删除逻辑节点后，如果引用计数归零，服务端就需要根据这个 hash 去定位 test/server_files/<sha256>。
     if (dao_file_get_info_by_id(file_id, sha256sum, &file_size) != 0) {
         return -1;
     }
