@@ -14,7 +14,9 @@
 #include "path_utils.h"
 
 #define EMPTY_FILE_SHA256 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-#define FILE_STORE_DIR_NAME "files"
+// 服务端真实文件实体统一放在 test/server_files 目录下。
+// file_cmds.c 里 touch/rm 也必须和上传下载使用同一个物理仓库。
+#define FILE_STORE_DIR_NAME "server_files"
 
 /**
  * @brief  根据当前逻辑路径和用户参数拼接逻辑全路径
@@ -106,7 +108,7 @@ static const char *get_server_base_dir(void) {
 }
 
 /**
- * @brief  确保真实文件仓库目录 test/files 存在
+ * @brief  确保真实文件仓库目录 test/server_files 存在
  * @param  store_dir 输出参数，用来保存最终真实文件仓库路径
  * @param  size store_dir 缓冲区大小
  * @return 成功返回 0，失败返回 -1
@@ -165,7 +167,7 @@ static int release_file_entity_if_unused(int file_id) {
     char real_path[MAX_PATH_LEN] = {0};
 
     // 第一步：先取出真实文件 hash。
-    // 删除逻辑节点后，如果引用计数归零，服务端就需要根据这个 hash 去定位 test/files/<sha256>。
+    // 删除逻辑节点后，如果引用计数归零，服务端就需要根据这个 hash 去定位 test/server_files/<sha256>。
     if (dao_file_get_info_by_id(file_id, sha256sum, &file_size) != 0) {
         return -1;
     }

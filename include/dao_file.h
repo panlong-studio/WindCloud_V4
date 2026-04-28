@@ -62,7 +62,7 @@ int dao_file_delete(int file_id);
  * @brief  根据 files 表 id 取出真实文件的 SHA-256 和大小
  * @param  file_id files 表主键 id
  * @param  sha256sum_out 输出参数，用来接收 64 位十六进制 SHA-256 字符串
- *         下载时需要把它拼到 test/files/<sha256> 中，定位真实文件
+ *         下载时需要把它拼到 test/server_files/<sha256> 中，定位真实文件
  * @param  out_file_size 输出参数，用来接收文件大小
  *         下载时服务端要先把这个大小发给客户端，客户端才能决定断点位置
  * @return 成功返回 0，失败返回 -1

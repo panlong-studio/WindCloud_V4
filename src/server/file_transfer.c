@@ -18,7 +18,13 @@
 #include "log.h"
 
 #define BUFFER_SIZE 4096
-#define FILE_STORE_DIR_NAME "files"
+// 100M 是第二期文档规定的大文件 mmap 分界线。
+// 小于等于该阈值的文件继续走普通 read/write 或 sendfile，超过该阈值才切换 mmap。
+#define LARGE_FILE_MMAP_THRESHOLD ((off_t)100 * 1024 * 1024)
+
+// 服务端真实文件实体统一放在 test/server_files 目录下。
+// 这里保存的是按 sha256 命名后的物理文件，不是用户可见的虚拟目录。
+#define FILE_STORE_DIR_NAME "server_files"
 
 /**
  * @brief  获取服务端真实文件仓库的根目录
@@ -40,7 +46,7 @@ static const char *get_server_base_dir(void) {
 }
 
 /**
- * @brief  确保真实文件仓库目录 test/files 存在
+ * @brief  确保真实文件仓库目录 test/server_files 存在
  * @param  store_dir 输出参数，用来保存最终可用的真实文件仓库路径
  * @param  size store_dir 缓冲区大小
  * @return 成功返回 0，失败返回 -1
@@ -49,7 +55,7 @@ static int ensure_store_dir(char *store_dir, int size) {
     struct stat st;
     const char *base_dir = get_server_base_dir();
 
-    // 真实文件统一放在 test/files 目录下。
+    // 真实文件统一放在 test/server_files 目录下。
     // 每个文件都不用用户原来的名字，而是直接用 sha256 值命名。
     // 这样服务器就能做到：
     // 1. 同内容文件只保存一份
@@ -208,7 +214,7 @@ static int check_store_file_ready(const char *sha256sum, off_t expected_size, of
     // 先默认成 0，避免调用方在失败分支读到未初始化值。
     *local_size = 0;
 
-    // 第一步：先把 test/files/<sha256> 的真实路径拼出来。
+    // 第一步：先把 test/server_files/<sha256> 的真实路径拼出来。
     // 如果连路径都无法构造，说明服务端存储环境本身就有问题。
     if (build_store_file_path(real_path, sizeof(real_path), sha256sum) != 0) {
         return -1;
@@ -307,6 +313,231 @@ static int finish_upload_db_work(ClientContext *ctx, const char *full_path, cons
 }
 
 /**
+ * @brief  使用 sendfile 发送小文件或普通下载文件
+ * @param  client_fd 当前客户端套接字
+ * @param  file_fd 已打开的真实文件 fd
+ * @param  real_path 真实文件路径，仅用于日志
+ * @param  offset 输入输出参数，保存当前发送偏移
+ * @param  remaining 本次还需要发送的字节数
+ * @return 全部发送成功返回 0，中断或失败返回 -1
+ */
+static int send_download_by_sendfile(int client_fd, int file_fd, const char *real_path,
+                                     off_t *offset, off_t remaining) {
+    // remaining 表示从断点之后还要发多少字节。
+    // 每一轮 sendfile 成功后都会扣减它。
+    while (remaining > 0) {
+        // sendfile 直接从文件 fd 发送到 socket，适合小文件保持原有高效路径。
+        ssize_t sent = sendfile(client_fd, file_fd, offset, (size_t)remaining);
+
+        // EINTR 表示系统调用被信号打断，可以安全重试。
+        if (sent < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            // 其它错误说明下载链路已经异常，中止本次发送。
+            LOG_WARN("下载 sendfile 发送中断，客户端fd=%d，路径=%s，错误码=%d", client_fd, real_path, errno);
+            return -1;
+        }
+
+        // sent == 0 一般表示没有更多数据可发，这里按中断处理，避免死循环。
+        if (sent == 0) {
+            return -1;
+        }
+
+        // 扣掉本轮已经成功发出的字节数。
+        remaining -= sent;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief  使用 mmap 发送超过 100M 的下载文件
+ * @param  client_fd 当前客户端套接字
+ * @param  file_fd 已打开的真实文件 fd
+ * @param  real_path 真实文件路径，仅用于日志
+ * @param  file_size 真实文件总大小
+ * @param  offset 本次下载的起始偏移
+ * @param  remaining 本次还需要发送的字节数
+ * @return 全部发送成功返回 0，中断或失败返回 -1
+ */
+static int send_download_by_mmap(int client_fd, int file_fd, const char *real_path,
+                                 off_t file_size, off_t offset, off_t remaining) {
+    // mmap 不能映射 0 字节；remaining 为 0 时也无需发送正文。
+    if (file_size == 0 || remaining <= 0) {
+        return 0;
+    }
+
+    // 大文件发送端按第二期要求切换为 mmap。
+    // 这里映射整个文件，再从客户端给出的断点偏移继续发送。
+    char *map_ptr = mmap(NULL, (size_t)file_size, PROT_READ, MAP_PRIVATE, file_fd, 0);
+    if (map_ptr == MAP_FAILED) {
+        LOG_WARN("下载 mmap 映射失败，客户端fd=%d，路径=%s，错误码=%d", client_fd, real_path, errno);
+        return -1;
+    }
+
+    // send_ptr 指向本次真正开始发送的位置。
+    char *send_ptr = map_ptr + offset;
+
+    // 按 BUFFER_SIZE 分块发送，避免 send_full 的 int 长度参数承载超大文件长度。
+    while (remaining > 0) {
+        // 默认每轮发送一个固定块。
+        int once = BUFFER_SIZE;
+
+        // 最后一轮不足一个块时，只发送剩余字节。
+        if (remaining < BUFFER_SIZE) {
+            once = (int)remaining;
+        }
+
+        // send_full 负责处理 socket 一次只发送部分字节的情况。
+        if (send_full(client_fd, send_ptr, once) == -1) {
+            LOG_WARN("下载 mmap 发送中断，客户端fd=%d，路径=%s", client_fd, real_path);
+            munmap(map_ptr, (size_t)file_size);
+            return -1;
+        }
+
+        // 指针和剩余长度同步后移，准备下一块。
+        send_ptr += once;
+        remaining -= once;
+    }
+
+    // 发送完成后释放映射区。
+    munmap(map_ptr, (size_t)file_size);
+    return 0;
+}
+
+/**
+ * @brief  保证把一段数据完整写入真实文件
+ * @param  fd 真实文件 fd
+ * @param  buf 待写入数据起始地址
+ * @param  len 本次必须写入的总字节数
+ * @return 成功返回 0，失败返回 -1
+ */
+static int write_store_file_full(int fd, const char *buf, int len) {
+    // total 记录本轮已经写进文件的字节数。
+    int total = 0;
+
+    // 普通 write 可能只写入部分数据，所以需要循环补齐。
+    while (total < len) {
+        // 从尚未写入的位置继续写。
+        int ret = write(fd, buf + total, len - total);
+
+        // ret <= 0 说明写文件失败，调用方需要按上传中断处理。
+        if (ret <= 0) {
+            return -1;
+        }
+
+        // 累计本次 write 成功写入的字节数。
+        total += ret;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief  使用 recv + write 接收小于等于 100M 的上传文件
+ * @param  client_fd 当前客户端套接字
+ * @param  file_fd 已打开的真实文件 fd
+ * @param  local_size 服务端已经保存的断点位置
+ * @param  remaining 本次还需要接收的字节数
+ * @param  received_count 输出参数，返回本次实际接收字节数
+ * @return 全部接收成功返回 0，中断或失败返回 -1
+ */
+static int recv_upload_by_write(int client_fd, int file_fd, off_t local_size,
+                                off_t remaining, off_t *received_count) {
+    // buf 是普通接收缓冲区，小文件路径不使用 mmap。
+    char buf[BUFFER_SIZE];
+
+    // 从服务端已有断点位置继续写真实文件。
+    if (lseek(file_fd, local_size, SEEK_SET) == -1) {
+        *received_count = 0;
+        return -1;
+    }
+
+    // 调用方需要知道中断时实际收到多少字节，用于截断文件。
+    *received_count = 0;
+
+    // 按块接收，直到补齐 remaining。
+    while (*received_count < remaining) {
+        // 默认每轮最多接收 BUFFER_SIZE 字节。
+        int once = BUFFER_SIZE;
+
+        // 最后一轮不足一个块时，只接收剩余字节。
+        if (remaining - *received_count < BUFFER_SIZE) {
+            once = (int)(remaining - *received_count);
+        }
+
+        // recv 不强求一次收满，收到多少就写多少。
+        ssize_t ret = recv(client_fd, buf, once, 0);
+        if (ret <= 0) {
+            return -1;
+        }
+
+        // 必须把本轮收到的数据完整写进文件，避免文件内容错位。
+        if (write_store_file_full(file_fd, buf, (int)ret) == -1) {
+            return -1;
+        }
+
+        // 累计本次上传实际落盘的数据量。
+        *received_count += ret;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief  使用 mmap 接收超过 100M 的上传文件
+ * @param  client_fd 当前客户端套接字
+ * @param  file_fd 已打开的真实文件 fd
+ * @param  file_len 客户端声明的完整文件大小
+ * @param  local_size 服务端已经保存的断点位置
+ * @param  remaining 本次还需要接收的字节数
+ * @param  received_count 输出参数，返回本次实际接收字节数
+ * @return 全部接收成功返回 0，中断或失败返回 -1
+ */
+static int recv_upload_by_mmap(int client_fd, int file_fd, off_t file_len, off_t local_size,
+                               off_t remaining, off_t *received_count) {
+    // mmap 的目的，是把大文件映射成一块内存，再把网络数据写进映射区。
+    char *map_ptr = mmap(NULL, (size_t)file_len, PROT_READ | PROT_WRITE, MAP_SHARED, file_fd, 0);
+    if (map_ptr == MAP_FAILED) {
+        *received_count = 0;
+        return -1;
+    }
+
+    // write_start 指向“本次应该开始写入网络数据的位置”。
+    char *write_start = map_ptr + local_size;
+
+    // 调用方需要根据实际接收量决定是否截断文件。
+    *received_count = 0;
+
+    // 按块收数据，直到把 remaining 收满为止。
+    while (*received_count < remaining) {
+        // 默认每轮最多接收 BUFFER_SIZE 字节。
+        int once = BUFFER_SIZE;
+
+        // 最后一轮不足一个块时，只接收剩余字节。
+        if (remaining - *received_count < BUFFER_SIZE) {
+            once = (int)(remaining - *received_count);
+        }
+
+        // 直接把网络数据写进 mmap 映射区。
+        ssize_t ret = recv(client_fd, write_start + *received_count, once, 0);
+        if (ret <= 0) {
+            munmap(map_ptr, (size_t)file_len);
+            return -1;
+        }
+
+        // 累计本次实际接收的数据量。
+        *received_count += ret;
+    }
+
+    // 大文件接收完成后释放映射区。
+    munmap(map_ptr, (size_t)file_len);
+    return 0;
+}
+
+/**
  * @brief  处理 gets 命令，按逻辑路径查找并向客户端发送真实文件内容
  * @param  client_fd 当前客户端套接字
  * @param  ctx 当前客户端会话上下文
@@ -397,33 +628,22 @@ void handle_gets(int client_fd, ClientContext *ctx, char *arg) {
               client_fd, full_path, real_path, (long long)offset, (long long)st.st_size);
 
     // remaining 表示这次还需要从真实文件里继续发送多少字节。
-    // 每次 sendfile 成功后都会减少，直到归零。
+    // 发送路径会根据 100M 阈值选择 sendfile 或 mmap。
     off_t remaining = st.st_size - offset;
+    int send_ret = 0;
 
-    // sendfile 会直接让内核把文件内容推到 socket。
-    // 这比“read 到用户态，再 send 回去”更省一次拷贝。
-    while (remaining > 0) {
-        ssize_t sent = sendfile(client_fd, file_fd, &offset, (size_t)remaining);
-
-        if (sent < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-
-            LOG_WARN("下载发送中断，客户端fd=%d，路径=%s，错误码=%d", client_fd, real_path, errno);
-            break;
-        }
-
-        if (sent == 0) {
-            break;
-        }
-
-        remaining -= sent;
+    // 第二期规则要求：超过 100M 的发送端使用 mmap。
+    // 下载方向的发送端是服务端，因此大文件下载走 mmap 发送。
+    if (st.st_size > LARGE_FILE_MMAP_THRESHOLD) {
+        send_ret = send_download_by_mmap(client_fd, file_fd, real_path, st.st_size, offset, remaining);
+    } else {
+        // 小文件保留原来的 sendfile 路径，避免为了小文件额外建立 mmap 映射。
+        send_ret = send_download_by_sendfile(client_fd, file_fd, real_path, &offset, remaining);
     }
 
     close(file_fd);
 
-    if (remaining == 0) {
+    if (send_ret == 0) {
         LOG_INFO("下载完成，客户端fd=%d，逻辑路径=%s，真实路径=%s", client_fd, full_path, real_path);
     }
 }
@@ -610,7 +830,7 @@ void handle_puts(int client_fd, ClientContext *ctx, char *arg) {
     }
 
     // 为了能直接在偏移位置写数据，先把文件拉到目标总大小。
-    // 后面 mmap 整个文件时，需要确保映射范围覆盖完整文件长度。
+    // 小文件 write 分支和大文件 mmap 分支都依赖这个完整目标长度。
     if (ftruncate(file_fd, file_len) == -1) {
         send_msg(client_fd, "服务端扩展文件失败");
         close(file_fd);
@@ -632,48 +852,22 @@ void handle_puts(int client_fd, ClientContext *ctx, char *arg) {
         return;
     }
 
-    // mmap 的目的，是把文件映射成一块内存。
-    // 这样 recv 收到的数据可以直接写进这块映射内存，对初学者来说逻辑很直观：
-    // “把 socket 数据写进文件对应的内存区域”。
-    char *map_ptr = mmap(NULL, file_len, PROT_READ | PROT_WRITE, MAP_SHARED, file_fd, 0);
-    if (map_ptr == MAP_FAILED) {
-        send_msg(client_fd, "服务端内存映射失败");
-        close(file_fd);
-        return;
-    }
-
-    // write_start 指向“本次应该开始写入网络数据的位置”。
-    // 如果前面已经续传了 local_size 字节，那么这里就从断点后继续写。
-    char *write_start = map_ptr + local_size;
     off_t received_count = 0;
+    int recv_ret = 0;
 
-    // 按块收数据，直到把 remaining 收满为止。
-    while (received_count < remaining) {
-        int once = BUFFER_SIZE;
-
-        if (remaining - received_count < BUFFER_SIZE) {
-            once = (int)(remaining - received_count);
-        }
-
-        // 注意这里不能用 recv_full。
-        // 因为网络传输中这一轮到底能收到多少字节，取决于内核当前给了多少。
-        // 我们只需要不断累计，直到总量达到 remaining 即可。
-        // 这里直接把网络数据写进 mmap 映射区。
-        // 这样收到的数据会同步落到真实文件对应的位置上。
-        ssize_t ret = recv(client_fd, write_start + received_count, once, 0);
-        if (ret <= 0) {
-            break;
-        }
-
-        received_count += ret;
+    // 第二期规则要求：小文件不强制 mmap，超过 100M 才切换 mmap。
+    // 上传方向的接收端是服务端，这里也按同一个阈值统一分支。
+    if (file_len > LARGE_FILE_MMAP_THRESHOLD) {
+        recv_ret = recv_upload_by_mmap(client_fd, file_fd, file_len, local_size, remaining, &received_count);
+    } else {
+        // 小文件使用 recv + write，避免所有非空文件都被 mmap。
+        recv_ret = recv_upload_by_write(client_fd, file_fd, local_size, remaining, &received_count);
     }
-
-    munmap(map_ptr, file_len);
 
     // 如果没收满，说明传输中断。
     // 这里把文件截断到“原来已有的部分 + 本次真正收到的部分”。
     // 下次客户端再上传相同 hash 时，就能从这个位置继续续传。
-    if (received_count < remaining) {
+    if (recv_ret != 0 || received_count < remaining) {
         // 假设本次只收到了一部分数据，就把文件截断到“真实收到的位置”。
         // 这样下次客户端再上传同一个 hash 时，
         // 服务端仍然可以从这个位置继续续传，而不是把脏数据留在文件尾部。

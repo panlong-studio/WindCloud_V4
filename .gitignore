@@ -79,5 +79,11 @@ cmake_install.cmake
 log/*.log
 
 # 忽略专门存放测试素材的目录
-test/
+test/*
+!test/client_files/
+!test/server_files/
+test/client_files/*
+test/server_files/*
+!test/client_files/.gitkeep
+!test/server_files/.gitkeep
 test/tmp/
