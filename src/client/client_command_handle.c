@@ -254,6 +254,146 @@ int request_transfer_ticket(ClientState *state, cmd_type_t cmd_type, const char 
 }
 
 /**
+ * @brief  在控制连接上申请多点下载方案
+ * @param  state 客户端统一状态结构体
+ * @param  arg 用户输入的文件名
+ * @param  plan_packet 输出参数，用来保存服务端返回的多点下载方案
+ * @return 成功返回 0，失败返回 -1
+ */
+int request_multi_gets_plan(ClientState *state, const char *arg, multi_gets_plan_packet_t *plan_packet) {
+    command_packet_t cmd_packet;
+
+    if (state == NULL || arg == NULL || plan_packet == NULL) {
+        return -1;
+    }
+
+    // 第五期后，控制连接上的 gets 不再直接传数据，
+    // 而是先向服务端申请“文件有多大、有哪些数据源可用”这份下载方案。
+    init_command_packet(&cmd_packet, CMD_TYPE_GETS, arg);
+    if (send_command_packet(state->ctrl_fd, &cmd_packet) == -1) {
+        printf("发送多点下载方案请求失败\n");
+        LOG_WARN("发送多点下载方案请求失败，参数=%s", arg);
+        return -1;
+    }
+
+    // 服务端这里返回的是专门的多点下载方案结构，不再是普通文本响应。
+    if (recv_multi_gets_plan_packet(state->ctrl_fd, plan_packet) <= 0) {
+        printf("接收多点下载方案失败\n");
+        LOG_WARN("接收多点下载方案失败，参数=%s", arg);
+        return -1;
+    }
+
+    printf("%s\n", plan_packet->message);
+    if (plan_packet->success != 1) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief  把分片下载票据申请参数拼成控制连接可发送的字符串
+ * @param  request_buf 输出参数，用来保存最终请求字符串
+ * @param  request_size request_buf 缓冲区大小
+ * @param  file_name 目标文件名
+ * @param  range_start 本分片起始位置
+ * @param  range_end 本分片结束位置
+ * @param  source_ip 数据源服务器 IP
+ * @param  source_port 数据源服务器端口
+ * @return 成功返回 0，失败返回 -1
+ */
+static int build_gets_range_ticket_request(char *request_buf, size_t request_size,
+                                           const char *file_name,
+                                           off_t range_start, off_t range_end,
+                                           const char *source_ip, const char *source_port) {
+    if (request_buf == NULL || request_size == 0 ||
+        file_name == NULL || source_ip == NULL || source_port == NULL) {
+        return -1;
+    }
+
+    // 第五期为了保持控制连接主循环简单，区间票据申请仍然复用 command_packet_t。
+    // 这里把文件名、区间和目标数据源编码成一个固定分隔格式的字符串。
+    if (snprintf(request_buf, request_size, "%s|%lld|%lld|%s|%s",
+                 file_name,
+                 (long long)range_start,
+                 (long long)range_end,
+                 source_ip,
+                 source_port) >= (int)request_size) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief  在控制连接上为某个下载分片申请区间票据
+ * @param  state 客户端统一状态结构体
+ * @param  file_name 目标文件名
+ * @param  range_start 本分片起始位置
+ * @param  range_end 本分片结束位置
+ * @param  source_ip 数据源服务器 IP
+ * @param  source_port 数据源服务器端口
+ * @param  ticket 输出参数，用来保存服务端返回的区间票据
+ * @param  ticket_size ticket 缓冲区大小
+ * @return 成功返回 0，失败返回 -1
+ */
+int request_gets_range_ticket(ClientState *state, const char *file_name,
+                              off_t range_start, off_t range_end,
+                              const char *source_ip, const char *source_port,
+                              char *ticket, size_t ticket_size) {
+    command_packet_t cmd_packet;
+    transfer_ticket_reply_packet_t reply_packet;
+    char request_buf[CMD_DATA_LEN] = {0};
+
+    if (state == NULL || file_name == NULL ||
+        source_ip == NULL || source_port == NULL ||
+        ticket == NULL || ticket_size == 0) {
+        return -1;
+    }
+
+    // 先把“文件名 + 分片区间 + 目标数据源”编码成一段字符串。
+    // 控制连接主循环只需要识别命令类型，再按约定格式拆开即可。
+    if (build_gets_range_ticket_request(request_buf,
+                                        sizeof(request_buf),
+                                        file_name,
+                                        range_start,
+                                        range_end,
+                                        source_ip,
+                                        source_port) != 0) {
+        return -1;
+    }
+
+    // CMD_TYPE_GETS_RANGE 表示“不是立刻下载，而是先申请一个分片票据”。
+    init_command_packet(&cmd_packet, CMD_TYPE_GETS_RANGE, request_buf);
+    if (send_command_packet(state->ctrl_fd, &cmd_packet) == -1) {
+        printf("发送下载分片票据请求失败\n");
+        LOG_WARN("发送下载分片票据请求失败，文件=%s，区间=%lld-%lld",
+                 file_name,
+                 (long long)range_start,
+                 (long long)range_end);
+        return -1;
+    }
+
+    if (recv_transfer_ticket_reply_packet(state->ctrl_fd, &reply_packet) <= 0) {
+        printf("接收下载分片票据失败\n");
+        LOG_WARN("接收下载分片票据失败，文件=%s，区间=%lld-%lld",
+                 file_name,
+                 (long long)range_start,
+                 (long long)range_end);
+        return -1;
+    }
+
+    if (reply_packet.success != 1) {
+        printf("%s\n", reply_packet.message);
+        return -1;
+    }
+
+    // 申请成功后，把票据拷贝给分片下载线程使用。
+    snprintf(ticket, ticket_size, "%s", reply_packet.ticket);
+    return 0;
+}
+
+/**
  * @brief  接收服务端返回的普通文本响应
  * @param  sock_fd 客户端和服务端通信的 socket
  * @param  reply_packet 输出参数，用来保存服务端响应

@@ -27,7 +27,7 @@
 #include "time_wheel.h"
 
 #define MAX_CONTROL_FD 65536
-#define CTRL_TIMEOUT_SEC 30
+#define DEFAULT_CTRL_TIMEOUT_SEC 120
 
 // pipe_fd[0] 用来读，pipe_fd[1] 用来写。
 // 父进程收到 Ctrl+C 后，会往管道里写一个字节。
@@ -68,6 +68,28 @@ static void load_value_or_default(const char *key, char *value, size_t value_sz,
     }
 
     snprintf(value, value_sz, "%s", default_value);
+}
+
+/**
+ * @brief  从配置文件读取整型配置，读不到或非法时回退到默认值
+ * @param  key 配置项名称
+ * @param  default_value 默认值
+ * @return 返回最终可用的整型值
+ */
+static int load_int_or_default(const char *key, int default_value) {
+    char tmp[256] = {0};
+    int value = 0;
+
+    if (get_target((char *)key, tmp) != 0) {
+        return default_value;
+    }
+
+    value = atoi(tmp);
+    if (value <= 0) {
+        return default_value;
+    }
+
+    return value;
 }
 
 /**
@@ -311,6 +333,7 @@ int main(){
     char db_user[64] = {0};
     char db_pwd[64] = {0};
     char db_name[64] = {0};
+    int ctrl_timeout_sec = DEFAULT_CTRL_TIMEOUT_SEC;
     int listen_fd = 0;
     int epfd = -1;
     int timer_fd = -1;
@@ -335,10 +358,14 @@ int main(){
     load_value_or_default("db_user", db_user, sizeof(db_user), "root");
     load_value_or_default("db_pwd",  db_pwd,  sizeof(db_pwd),  "123456");
     load_value_or_default("db_name", db_name, sizeof(db_name), "netdisk_db");
+    ctrl_timeout_sec = load_int_or_default("ctrl_timeout_sec", DEFAULT_CTRL_TIMEOUT_SEC);
 
     //=================先初始化日志========================
     init_log_with_fallback(log_level, log_file);
-    LOG_INFO("服务端配置加载完成，地址=%s，端口=%s", ip, port);
+    LOG_INFO("服务端配置加载完成，地址=%s，端口=%s，控制连接超时=%d秒",
+             ip,
+             port,
+             ctrl_timeout_sec);
 
     //===============服务端数据库自动建表==========================
     if (init_database(db_host, db_user, db_pwd, db_name) != 0) {
@@ -390,7 +417,7 @@ int main(){
     //=================子进程继续执行服务端主逻辑========================
     init_socket(&listen_fd, ip, port);
     init_thread_pool(&pool, 5);
-    time_wheel_init(&wheel, CTRL_TIMEOUT_SEC);
+    time_wheel_init(&wheel, ctrl_timeout_sec);
 
     conn_map = (ControlConn **)calloc(MAX_CONTROL_FD, sizeof(ControlConn *));
     if (conn_map == NULL) {

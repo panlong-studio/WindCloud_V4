@@ -10,10 +10,15 @@ BUILD_DIR  = build
 BIN_DIR    = bin
 
 # 3. 源文件定位
-# 获取各个模块的 .c 文件
+# common 目录当前还是单层结构，继续直接取即可。
 SRCS_COMMON = $(wildcard $(SRC_DIR)/common/*.c)
+
+# client 目录当前文件较少，先保持单层结构。
 SRCS_CLIENT = $(wildcard $(SRC_DIR)/client/*.c)
-SRCS_SERVER = $(wildcard $(SRC_DIR)/server/*.c)
+
+# server 目录已经按功能拆成多级子目录。
+# 这里使用 find 递归收集全部 .c 文件，避免后续每新增一个子目录都要手改 Makefile。
+SRCS_SERVER = $(shell find $(SRC_DIR)/server -type f -name '*.c' | sort)
 
 # 4. 目标文件定位 (将 .c 替换为 .o，并存入 build 目录)
 OBJS_COMMON = $(SRCS_COMMON:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)

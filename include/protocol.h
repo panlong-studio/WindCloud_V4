@@ -10,6 +10,10 @@
 // 文件名也统一使用固定长度数组。
 #define FILE_NAME_LEN 256
 
+// 多点下载时，单次最多返回多少个可用数据源服务器。
+// 第一版先把上限控制在 8，既够用，也方便把协议结构体做成固定大小。
+#define MAX_SOURCE_SERVER_COUNT 8
+
 // JWT 令牌使用固定长度字符数组保存。
 // 这样客户端和服务端都可以直接按结构体完整收发。
 #define TOKEN_LEN 1024
@@ -63,6 +67,7 @@ typedef enum {
     CMD_TYPE_REPLY,       // 服务端返回的普通文本响应
     CMD_TYPE_LOGIN,       // 登录命令
     CMD_TYPE_REGISTER,    // 注册命令
+    CMD_TYPE_GETS_RANGE,  // 第五期内部使用：为某个下载分片申请区间票据
 } cmd_type_t;
 
 // 普通命令结构体。
@@ -119,6 +124,26 @@ typedef struct {
     char message[CMD_DATA_LEN];                // 给客户端显示的提示信息
     char ticket[TRANSFER_TICKET_LEN];          // 申请成功后返回的一次性传输票据
 } transfer_ticket_reply_packet_t;
+
+// 一个数据源服务器的信息。
+// 第五期中，控制服务器会把可用的数据源列表返回给客户端。
+typedef struct {
+    char ip[64];     // 数据源服务器 IP
+    char port[16];   // 数据源服务器端口
+} source_server_t;
+
+// 多点下载方案响应结构体。
+// 客户端先通过控制连接申请方案，
+// 服务端返回文件信息和可用数据源列表。
+typedef struct {
+    int success;                                        // 1 表示成功，0 表示失败
+    off_t file_size;                                    // 目标文件总大小
+    char file_name[FILE_NAME_LEN];                      // 目标文件名
+    char file_hash[65];                                 // 目标文件 SHA-256
+    int source_count;                                   // 当前返回了多少个可用数据源
+    source_server_t sources[MAX_SOURCE_SERVER_COUNT];   // 数据源服务器列表
+    char message[CMD_DATA_LEN];                         // 提示信息
+} multi_gets_plan_packet_t;
 
 /**
  * @brief  把命令字符串转换成命令枚举值
@@ -204,6 +229,22 @@ void init_auth_reply_packet(auth_reply_packet_t *packet, int success, int user_i
  */
 void init_transfer_ticket_reply_packet(transfer_ticket_reply_packet_t *packet,
                                        int success, const char *message, const char *ticket);
+
+/**
+ * @brief  初始化多点下载方案响应结构体
+ * @param  packet 要被填写的结构体地址
+ * @param  success 是否成功
+ * @param  file_name 目标文件名，可以传 NULL
+ * @param  file_size 目标文件总大小
+ * @param  file_hash 目标文件 SHA-256，可以传 NULL
+ * @param  source_count 数据源数量
+ * @param  message 提示信息，可以传 NULL
+ * @return 无
+ */
+void init_multi_gets_plan_packet(multi_gets_plan_packet_t *packet, int success,
+                                 const char *file_name, off_t file_size,
+                                 const char *file_hash, int source_count,
+                                 const char *message);
 
 /**
  * @brief  发送一个完整的普通命令结构体
@@ -300,5 +341,21 @@ int send_transfer_ticket_reply_packet(int fd, const transfer_ticket_reply_packet
  * @return 成功时返回接收字节数，失败返回 <= 0 或 -1
  */
 int recv_transfer_ticket_reply_packet(int fd, transfer_ticket_reply_packet_t *packet);
+
+/**
+ * @brief  发送一个完整的多点下载方案响应结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 要发送的结构体地址
+ * @return 成功返回 0，失败返回 -1
+ */
+int send_multi_gets_plan_packet(int fd, const multi_gets_plan_packet_t *packet);
+
+/**
+ * @brief  接收一个完整的多点下载方案响应结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 输出参数，用来保存接收结果
+ * @return 成功时返回接收字节数，失败返回 <= 0 或 -1
+ */
+int recv_multi_gets_plan_packet(int fd, multi_gets_plan_packet_t *packet);
 
 #endif

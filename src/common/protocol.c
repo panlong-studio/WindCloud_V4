@@ -32,6 +32,8 @@ cmd_type_t get_cmd_type(const char *cmd_str) {
     if(strcmp(cmd_str,"touch")==0){
         return CMD_TYPE_TOUCH;
     }
+    // 当前项目统一只保留 rm 作为删除命令入口。
+    // 这样可以避免 rm/remove 两套名字重复增加学习成本。
     if (strcmp(cmd_str, "rm") == 0) {
         return CMD_TYPE_RM;
     }
@@ -238,6 +240,40 @@ void init_transfer_ticket_reply_packet(transfer_ticket_reply_packet_t *packet,
 }
 
 /**
+ * @brief  初始化多点下载方案响应结构体
+ * @param  packet 要写入的响应结构体地址
+ * @param  success 是否成功
+ * @param  file_name 目标文件名
+ * @param  file_size 目标文件总大小
+ * @param  file_hash 目标文件 SHA-256
+ * @param  source_count 当前可用数据源数量
+ * @param  message 提示信息
+ * @return 无
+ */
+void init_multi_gets_plan_packet(multi_gets_plan_packet_t *packet, int success,
+                                 const char *file_name, off_t file_size,
+                                 const char *file_hash, int source_count,
+                                 const char *message) {
+    memset(packet, 0, sizeof(multi_gets_plan_packet_t));
+    packet->success = success;
+    packet->file_size = file_size;
+    packet->source_count = source_count;
+
+    if (file_name != NULL) {
+        strncpy(packet->file_name, file_name, FILE_NAME_LEN - 1);
+    }
+
+    if (file_hash != NULL) {
+        strncpy(packet->file_hash, file_hash, 64);
+        packet->file_hash[64] = '\0';
+    }
+
+    if (message != NULL) {
+        strncpy(packet->message, message, CMD_DATA_LEN - 1);
+    }
+}
+
+/**
  * @brief  发送一个完整的普通命令包
  * @param  fd socket 文件描述符
  * @param  packet 要发送的普通命令结构体地址
@@ -400,5 +436,45 @@ int recv_transfer_ticket_reply_packet(int fd, transfer_ticket_reply_packet_t *pa
 
     packet->message[CMD_DATA_LEN - 1] = '\0';
     packet->ticket[TRANSFER_TICKET_LEN - 1] = '\0';
+    return ret;
+}
+
+/**
+ * @brief  发送一个完整的多点下载方案响应结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 要发送的结构体地址
+ * @return 成功返回 0，失败返回 -1
+ */
+int send_multi_gets_plan_packet(int fd, const multi_gets_plan_packet_t *packet) {
+    return send_full(fd, packet, sizeof(multi_gets_plan_packet_t));
+}
+
+/**
+ * @brief  接收一个完整的多点下载方案响应结构体
+ * @param  fd socket 文件描述符
+ * @param  packet 输出参数，用来保存接收结果
+ * @return 成功时返回接收字节数，失败返回 <= 0 或 -1
+ */
+int recv_multi_gets_plan_packet(int fd, multi_gets_plan_packet_t *packet) {
+    int ret = recv_full(fd, packet, sizeof(multi_gets_plan_packet_t));
+    int i = 0;
+
+    if (ret <= 0) {
+        return ret;
+    }
+
+    if (packet->source_count < 0 || packet->source_count > MAX_SOURCE_SERVER_COUNT) {
+        return -1;
+    }
+
+    packet->file_name[FILE_NAME_LEN - 1] = '\0';
+    packet->file_hash[64] = '\0';
+    packet->message[CMD_DATA_LEN - 1] = '\0';
+
+    for (i = 0; i < MAX_SOURCE_SERVER_COUNT; ++i) {
+        packet->sources[i].ip[sizeof(packet->sources[i].ip) - 1] = '\0';
+        packet->sources[i].port[sizeof(packet->sources[i].port) - 1] = '\0';
+    }
+
     return ret;
 }

@@ -11,68 +11,42 @@
 #include <errno.h>
 #include "file_transfer.h"
 #include "dao_file.h"
+#include "dao_file_source.h"
 #include "dao_vfs.h"
 #include "path_utils.h"
 #include "session.h"
 #include "protocol.h"
 #include "log.h"
+#include "config.h"
+#include "server_identity.h"
+#include "storage_paths.h"
 
 #define BUFFER_SIZE 4096
-#define FILE_STORE_DIR_NAME "files"
+#define LARGE_FILE_MMAP_THRESHOLD (100 * 1024 * 1024)
 
 /**
- * @brief  获取服务端真实文件仓库的根目录
- * @return 成功时返回可用的根目录字符串，失败时退回默认 SERVER_BASE_DIR
- */
-static const char *get_server_base_dir(void) {
-    // 工程可能从项目根目录启动，也可能从 bin 目录启动。
-    // 这两种启动方式下，test 目录的相对路径不同。
-    // 这里优先探测当前运行环境里真实存在的目录，避免后续拼路径时把文件落到错误位置。
-    if (access(SERVER_BASE_DIR, F_OK) == 0) {
-        return SERVER_BASE_DIR;
-    }
-
-    if (access("./test", F_OK) == 0) {
-        return "./test";
-    }
-
-    return SERVER_BASE_DIR;
-}
-
-/**
- * @brief  确保真实文件仓库目录 test/files 存在
+ * @brief  确保真实文件仓库目录 test/server_files 存在
  * @param  store_dir 输出参数，用来保存最终可用的真实文件仓库路径
  * @param  size store_dir 缓冲区大小
  * @return 成功返回 0，失败返回 -1
  */
 static int ensure_store_dir(char *store_dir, int size) {
-    struct stat st;
-    const char *base_dir = get_server_base_dir();
+    char dir_name[128] = {0};
 
-    // 真实文件统一放在 test/files 目录下。
+    // 真实文件统一放在 test/server_files 目录下。
     // 每个文件都不用用户原来的名字，而是直接用 sha256 值命名。
     // 这样服务器就能做到：
     // 1. 同内容文件只保存一份
     // 2. 用户目录结构和真实物理文件彻底分离
-    if (snprintf(store_dir, size, "%s/%s", base_dir, FILE_STORE_DIR_NAME) >= size) {
+    if (get_target("server_file_dir", dir_name) != 0) {
+        snprintf(dir_name, sizeof(dir_name), "%s", "server_files");
+    }
+
+    if (get_server_file_dir_path(store_dir, size, dir_name) != 0) {
         return -1;
     }
 
-    if (stat(store_dir, &st) == 0) {
-        if (S_ISDIR(st.st_mode)) {
-            return 0;
-        }
-
-        // 如果同名路径存在，但它不是目录，而是普通文件，
-        // 那当前存储环境就是错误的，后续不能继续用。
-        return -1;
-    }
-
-    if (mkdir(store_dir, 0777) == -1 && errno != EEXIST) {
-        return -1;
-    }
-
-    return 0;
+    return ensure_storage_dir_exists(store_dir);
 }
 
 /**
@@ -177,6 +151,125 @@ static int is_valid_vfs_name(const char *file_name) {
 }
 
 /**
+ * @brief  把一段数据完整写入真实文件
+ * @param  file_fd 真实文件 fd
+ * @param  buf 待写入数据起始地址
+ * @param  len 本次需要写入的总字节数
+ * @return 成功返回 0，失败返回 -1
+ */
+static int write_file_full(int file_fd, const char *buf, int len) {
+    int total = 0;
+
+    // write 不保证一次把数据全写完。
+    // 这里做一个完整写入循环，避免上传接收端把文件写缺。
+    while (total < len) {
+        int ret = write(file_fd, buf + total, len - total);
+        if (ret <= 0) {
+            return -1;
+        }
+        total += ret;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief  使用 sendfile 发送真实文件的指定区间
+ * @param  client_fd 当前客户端套接字
+ * @param  file_fd 真实文件 fd
+ * @param  offset 起始偏移位置
+ * @param  file_size 文件总大小
+ * @param  real_path 真实文件路径，仅用于日志
+ * @return 成功返回 0，失败返回 -1
+ */
+static int send_file_by_sendfile(int client_fd, int file_fd, off_t offset,
+                                 off_t file_size, const char *real_path) {
+    off_t current_offset = offset;
+    off_t remaining = file_size - offset;
+
+    while (remaining > 0) {
+        ssize_t sent = sendfile(client_fd, file_fd, &current_offset, (size_t)remaining);
+
+        if (sent < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            LOG_WARN("下载发送中断，客户端fd=%d，路径=%s，错误码=%d", client_fd, real_path, errno);
+            return -1;
+        }
+
+        if (sent == 0) {
+            LOG_WARN("下载提前结束，客户端fd=%d，路径=%s，剩余字节=%lld",
+                     client_fd,
+                     real_path,
+                     (long long)remaining);
+            return -1;
+        }
+
+        remaining -= sent;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief  使用 mmap 发送真实大文件的指定区间
+ * @param  client_fd 当前客户端套接字
+ * @param  file_fd 真实文件 fd
+ * @param  offset 起始偏移位置
+ * @param  file_size 文件总大小
+ * @param  real_path 真实文件路径，仅用于日志
+ * @return 成功返回 0，失败返回 -1
+ */
+static int send_file_by_mmap(int client_fd, int file_fd, off_t offset,
+                             off_t file_size, const char *real_path) {
+    char *map_ptr = NULL;
+    char *read_start = NULL;
+    off_t remaining = file_size - offset;
+    off_t sent_count = 0;
+
+    if (remaining <= 0) {
+        return 0;
+    }
+
+    // 文件超过 100M 后，按照第二期要求，改用 mmap 读取真实文件再发送。
+    map_ptr = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, file_fd, 0);
+    if (map_ptr == MAP_FAILED) {
+        LOG_ERROR("下载 mmap 失败，客户端fd=%d，路径=%s，大小=%lld，错误码=%d",
+                  client_fd,
+                  real_path,
+                  (long long)file_size,
+                  errno);
+        return -1;
+    }
+
+    read_start = map_ptr + offset;
+    while (sent_count < remaining) {
+        int once = BUFFER_SIZE;
+
+        if (remaining - sent_count < BUFFER_SIZE) {
+            once = (int)(remaining - sent_count);
+        }
+
+        if (send_full(client_fd, read_start + sent_count, once) == -1) {
+            LOG_WARN("mmap 下载发送中断，客户端fd=%d，路径=%s，已发送=%lld，总大小=%lld",
+                     client_fd,
+                     real_path,
+                     (long long)(offset + sent_count),
+                     (long long)file_size);
+            munmap(map_ptr, file_size);
+            return -1;
+        }
+
+        sent_count += once;
+    }
+
+    munmap(map_ptr, file_size);
+    return 0;
+}
+
+/**
  * @brief  在下载失败时向客户端发送统一的失败文件包
  * @param  client_fd 当前客户端套接字
  * @param  file_name 客户端请求下载的文件名
@@ -208,7 +301,7 @@ static int check_store_file_ready(const char *sha256sum, off_t expected_size, of
     // 先默认成 0，避免调用方在失败分支读到未初始化值。
     *local_size = 0;
 
-    // 第一步：先把 test/files/<sha256> 的真实路径拼出来。
+    // 第一步：先把 test/server_files/<sha256> 的真实路径拼出来。
     // 如果连路径都无法构造，说明服务端存储环境本身就有问题。
     if (build_store_file_path(real_path, sizeof(real_path), sha256sum) != 0) {
         return -1;
@@ -285,41 +378,63 @@ static int finish_upload_db_work(ClientContext *ctx, const char *full_path, cons
                                  const char *sha256sum, off_t file_size) {
     int file_id = 0;
     off_t db_file_size = 0;
+    char current_ip[64] = {0};
+    char current_port[16] = {0};
+    int ret = -1;
 
     // 先尝试把这份真实文件作为“新文件”插入 files 表。
     // 这是“首次上传某个新内容”的标准分支。
     // 插入成功时，files.count 初始就是 1，因此后面补 paths 节点时无需再次加引用计数。
     if (dao_file_insert(sha256sum, file_size, &file_id) == 0) {
-        return create_user_file_link(ctx, full_path, file_name, file_id, 0);
+        ret = create_user_file_link(ctx, full_path, file_name, file_id, 0);
+    } else if (dao_file_find_by_sha256(sha256sum, &file_id, &db_file_size) == 0) {
+        // 如果插入失败，最常见的情况是：
+        // 同一时刻别的线程已经插入了同一个 hash。
+        // 那当前线程就退化为：
+        // 1. 再查一次 file_id
+        // 2. 给当前用户补一条 paths
+        // 3. 再把 count +1
+        ret = create_user_file_link(ctx, full_path, file_name, file_id, 1);
     }
 
-    // 如果插入失败，最常见的情况是：
-    // 同一时刻别的线程已经插入了同一个 hash。
-    // 那当前线程就退化为：
-    // 1. 再查一次 file_id
-    // 2. 给当前用户补一条 paths
-    // 3. 再把 count +1
-    if (dao_file_find_by_sha256(sha256sum, &file_id, &db_file_size) == 0) {
-        return create_user_file_link(ctx, full_path, file_name, file_id, 1);
+    if (ret != 0) {
+        return -1;
     }
 
-    return -1;
+    // 第五期以后，服务端除了保存真实文件和逻辑路径关系，
+    // 还要把“当前服务器拥有这份真实文件”登记到 file_sources 表里。
+    if (get_current_server_address(current_ip, sizeof(current_ip), current_port, sizeof(current_port)) != 0) {
+        return -1;
+    }
+
+    if (dao_file_source_upsert(file_id, current_ip, current_port) != 0) {
+        return -1;
+    }
+
+    return 0;
 }
 
 /**
- * @brief  处理 gets 命令，按逻辑路径查找并向客户端发送真实文件内容
+ * @brief  处理下载请求，可选择发送完整文件或指定区间
  * @param  client_fd 当前客户端套接字
  * @param  ctx 当前客户端会话上下文
  * @param  arg 用户输入的文件名
+ * @param  use_range 是否启用指定区间发送
+ * @param  range_start 指定区间的起始位置
+ * @param  range_end 指定区间的结束位置
  * @return 无
  */
-void handle_gets(int client_fd, ClientContext *ctx, char *arg) {
+static void handle_gets_common(int client_fd, ClientContext *ctx, char *arg,
+                               int use_range, off_t range_start, off_t range_end) {
     char full_path[512] = {0};
     char real_path[MAX_PATH_LEN] = {0};
     char sha256sum[65] = {0};
     int node_id = 0;
     int file_id = 0;
     off_t file_size = 0;
+    off_t effective_start = 0;
+    off_t effective_end = 0;
+    off_t logical_total_size = 0;
 
     if (build_full_virtual_path(full_path, sizeof(full_path), ctx, arg) == -1) {
         LOG_WARN("下载路径非法，客户端fd=%d，当前路径=%s，参数=%s", client_fd, ctx->current_path, arg);
@@ -366,9 +481,33 @@ void handle_gets(int client_fd, ClientContext *ctx, char *arg) {
         return;
     }
 
+    effective_start = 0;
+    effective_end = st.st_size - 1;
+
+    // 第五期多点下载会给每个传输线程分配一个固定区间。
+    // 如果当前连接携带的是区间票据，这里就把真正可发送的范围收紧到票据允许的片段。
+    if (use_range) {
+        if (range_start < 0 || range_end < range_start || range_end >= st.st_size) {
+            LOG_WARN("下载区间非法，客户端fd=%d，路径=%s，区间=%lld-%lld，文件大小=%lld",
+                     client_fd,
+                     real_path,
+                     (long long)range_start,
+                     (long long)range_end,
+                     (long long)st.st_size);
+            close(file_fd);
+            send_gets_failed_packet(client_fd, arg);
+            return;
+        }
+
+        effective_start = range_start;
+        effective_end = range_end;
+    }
+
+    logical_total_size = effective_end - effective_start + 1;
+
     // 先把文件大小发给客户端，客户端才知道自己该从哪里续传。
     file_packet_t server_file_packet;
-    init_file_packet(&server_file_packet, CMD_TYPE_GETS, arg, st.st_size, 0, NULL);
+    init_file_packet(&server_file_packet, CMD_TYPE_GETS, arg, logical_total_size, 0, NULL);
 
     if (send_file_packet(client_fd, &server_file_packet) == -1) {
         LOG_WARN("发送下载文件信息失败，客户端fd=%d，路径=%s", client_fd, real_path);
@@ -385,47 +524,74 @@ void handle_gets(int client_fd, ClientContext *ctx, char *arg) {
     }
 
     // 客户端回传的 offset 表示“本地已经下载完成的字节数”。
-    // 服务端随后会从这个偏移位置继续发送，实现下载断点续传。
+    // 在第五期分片下载里，这个 offset 仍然是“本分片已经完成的字节数”。
     off_t offset = client_file_packet.offset;
 
-    if (offset < 0 || offset > st.st_size) {
+    if (offset < 0 || offset > logical_total_size) {
         // 如果客户端给出的断点非法，最简单安全的处理方式就是从头开始发。
         offset = 0;
     }
 
-    LOG_DEBUG("准备下载真实文件，客户端fd=%d，逻辑路径=%s，真实路径=%s，偏移=%lld，大小=%lld",
-              client_fd, full_path, real_path, (long long)offset, (long long)st.st_size);
+    offset += effective_start;
 
-    // remaining 表示这次还需要从真实文件里继续发送多少字节。
-    // 每次 sendfile 成功后都会减少，直到归零。
-    off_t remaining = st.st_size - offset;
+    LOG_DEBUG("准备下载真实文件，客户端fd=%d，逻辑路径=%s，真实路径=%s，发送区间=%lld-%lld，起始偏移=%lld，总大小=%lld",
+              client_fd, full_path, real_path,
+              (long long)effective_start,
+              (long long)effective_end,
+              (long long)offset,
+              (long long)logical_total_size);
 
-    // sendfile 会直接让内核把文件内容推到 socket。
-    // 这比“read 到用户态，再 send 回去”更省一次拷贝。
-    while (remaining > 0) {
-        ssize_t sent = sendfile(client_fd, file_fd, &offset, (size_t)remaining);
-
-        if (sent < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-
-            LOG_WARN("下载发送中断，客户端fd=%d，路径=%s，错误码=%d", client_fd, real_path, errno);
-            break;
+    // 第五步：根据文件大小选择发送方式。
+    // 小文件继续使用 sendfile，大文件改成 mmap 发送。
+    if (logical_total_size > LARGE_FILE_MMAP_THRESHOLD) {
+        LOG_INFO("下载文件超过 100M，改用 mmap 发送，客户端fd=%d，路径=%s，区间=%lld-%lld，大小=%lld",
+                 client_fd,
+                 real_path,
+                 (long long)effective_start,
+                 (long long)effective_end,
+                 (long long)logical_total_size);
+        if (send_file_by_mmap(client_fd, file_fd, offset, effective_end + 1, real_path) != 0) {
+            close(file_fd);
+            return;
         }
-
-        if (sent == 0) {
-            break;
+    } else {
+        if (send_file_by_sendfile(client_fd, file_fd, offset, effective_end + 1, real_path) != 0) {
+            close(file_fd);
+            return;
         }
-
-        remaining -= sent;
     }
 
     close(file_fd);
+    LOG_INFO("下载完成，客户端fd=%d，逻辑路径=%s，真实路径=%s，区间=%lld-%lld",
+             client_fd,
+             full_path,
+             real_path,
+             (long long)effective_start,
+             (long long)effective_end);
+}
 
-    if (remaining == 0) {
-        LOG_INFO("下载完成，客户端fd=%d，逻辑路径=%s，真实路径=%s", client_fd, full_path, real_path);
-    }
+/**
+ * @brief  处理 gets 命令，按逻辑路径查找并向客户端发送完整文件
+ * @param  client_fd 当前客户端套接字
+ * @param  ctx 当前客户端会话上下文
+ * @param  arg 用户输入的文件名
+ * @return 无
+ */
+void handle_gets(int client_fd, ClientContext *ctx, char *arg) {
+    handle_gets_common(client_fd, ctx, arg, 0, 0, -1);
+}
+
+/**
+ * @brief  处理指定字节区间的 gets 下载请求
+ * @param  client_fd 当前客户端套接字
+ * @param  ctx 当前客户端会话上下文
+ * @param  arg 用户输入的文件名
+ * @param  range_start 本次允许发送的起始位置
+ * @param  range_end 本次允许发送的结束位置
+ * @return 无
+ */
+void handle_gets_range(int client_fd, ClientContext *ctx, char *arg, off_t range_start, off_t range_end) {
+    handle_gets_common(client_fd, ctx, arg, 1, range_start, range_end);
 }
 
 /**
@@ -632,43 +798,70 @@ void handle_puts(int client_fd, ClientContext *ctx, char *arg) {
         return;
     }
 
-    // mmap 的目的，是把文件映射成一块内存。
-    // 这样 recv 收到的数据可以直接写进这块映射内存，对初学者来说逻辑很直观：
-    // “把 socket 数据写进文件对应的内存区域”。
-    char *map_ptr = mmap(NULL, file_len, PROT_READ | PROT_WRITE, MAP_SHARED, file_fd, 0);
-    if (map_ptr == MAP_FAILED) {
-        send_msg(client_fd, "服务端内存映射失败");
-        close(file_fd);
-        return;
-    }
-
-    // write_start 指向“本次应该开始写入网络数据的位置”。
-    // 如果前面已经续传了 local_size 字节，那么这里就从断点后继续写。
-    char *write_start = map_ptr + local_size;
     off_t received_count = 0;
 
-    // 按块收数据，直到把 remaining 收满为止。
-    while (received_count < remaining) {
-        int once = BUFFER_SIZE;
+    if (file_len > LARGE_FILE_MMAP_THRESHOLD) {
+        char *map_ptr = mmap(NULL, file_len, PROT_READ | PROT_WRITE, MAP_SHARED, file_fd, 0);
+        char *write_start = NULL;
 
-        if (remaining - received_count < BUFFER_SIZE) {
-            once = (int)(remaining - received_count);
+        if (map_ptr == MAP_FAILED) {
+            send_msg(client_fd, "服务端内存映射失败");
+            close(file_fd);
+            return;
         }
 
-        // 注意这里不能用 recv_full。
-        // 因为网络传输中这一轮到底能收到多少字节，取决于内核当前给了多少。
-        // 我们只需要不断累计，直到总量达到 remaining 即可。
-        // 这里直接把网络数据写进 mmap 映射区。
-        // 这样收到的数据会同步落到真实文件对应的位置上。
-        ssize_t ret = recv(client_fd, write_start + received_count, once, 0);
-        if (ret <= 0) {
-            break;
+        // 大于 100M 的上传文件继续走 mmap 接收路径。
+        // 这样可以保持第二期要求中的“大文件使用 mmap”特点。
+        write_start = map_ptr + local_size;
+        while (received_count < remaining) {
+            int once = BUFFER_SIZE;
+
+            if (remaining - received_count < BUFFER_SIZE) {
+                once = (int)(remaining - received_count);
+            }
+
+            ssize_t ret = recv(client_fd, write_start + received_count, once, 0);
+            if (ret <= 0) {
+                break;
+            }
+
+            received_count += ret;
         }
 
-        received_count += ret;
+        munmap(map_ptr, file_len);
+    } else {
+        char buf[BUFFER_SIZE];
+
+        // 小文件接收继续用更直观的 write 路径。
+        // 这样也避免之前“所有非空文件都 mmap”的问题。
+        if (lseek(file_fd, local_size, SEEK_SET) == -1) {
+            send_msg(client_fd, "服务端定位文件失败");
+            close(file_fd);
+            return;
+        }
+
+        while (received_count < remaining) {
+            int once = BUFFER_SIZE;
+            ssize_t ret = 0;
+
+            if (remaining - received_count < BUFFER_SIZE) {
+                once = (int)(remaining - received_count);
+            }
+
+            ret = recv(client_fd, buf, once, 0);
+            if (ret <= 0) {
+                break;
+            }
+
+            if (write_file_full(file_fd, buf, (int)ret) == -1) {
+                send_msg(client_fd, "服务端写入文件失败");
+                close(file_fd);
+                return;
+            }
+
+            received_count += ret;
+        }
     }
-
-    munmap(map_ptr, file_len);
 
     // 如果没收满，说明传输中断。
     // 这里把文件截断到“原来已有的部分 + 本次真正收到的部分”。

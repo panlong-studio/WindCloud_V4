@@ -49,6 +49,7 @@ static int generate_ticket_id(char *ticket_id, size_t size) {
         return -1;
     }
 
+    // 16 字节随机数转成 32 位十六进制字符串，足够当前项目做一次性编号使用。
     if (RAND_bytes(random_bytes, sizeof(random_bytes)) != 1) {
         return -1;
     }
@@ -99,21 +100,29 @@ static int alloc_ticket_slot(void) {
  * @return 成功返回 0，失败返回 -1
  */
 int issue_transfer_ticket(int user_id, cmd_type_t cmd_type, const char *full_path,
+                          off_t range_start, off_t range_end,
+                          const char *source_ip, const char *source_port,
                           char *ticket, size_t ticket_size) {
     char ticket_id[TRANSFER_TICKET_ID_LEN] = {0};
     time_t now = time(NULL);
     int slot = -1;
 
     if (full_path == NULL || full_path[0] == '\0' ||
+        source_ip == NULL || source_ip[0] == '\0' ||
+        source_port == NULL || source_port[0] == '\0' ||
         ticket == NULL || ticket_size == 0) {
         return -1;
     }
 
+    // 第一步：先为这张票据生成一个唯一编号。
     if (generate_ticket_id(ticket_id, sizeof(ticket_id)) != 0) {
         return -1;
     }
 
+    // 第二步：把用户、命令、路径、区间、数据源、票据编号一起写进 JWT 负载。
     if (jwt_create_transfer_ticket(user_id, cmd_type, full_path,
+                                   range_start, range_end,
+                                   source_ip, source_port,
                                    ticket_id, ticket, ticket_size) != 0) {
         return -1;
     }
@@ -123,6 +132,7 @@ int issue_transfer_ticket(int user_id, cmd_type_t cmd_type, const char *full_pat
     // 每次签发新票据前，先把已过期记录清掉，避免表被历史垃圾占满。
     cleanup_expired_tickets(now);
 
+    // 第三步：在内存票据表里登记这张票据，供“仅使用一次”的约束检查。
     slot = alloc_ticket_slot();
     if (slot == -1) {
         pthread_mutex_unlock(&g_transfer_ticket_lock);
@@ -137,10 +147,14 @@ int issue_transfer_ticket(int user_id, cmd_type_t cmd_type, const char *full_pat
     g_transfer_tickets[slot].expire_time = now + TRANSFER_TICKET_EXPIRE_SECONDS;
 
     pthread_mutex_unlock(&g_transfer_ticket_lock);
-    LOG_INFO("一次性传输票据签发成功，用户=%d，命令类型=%d，路径=%s，票据编号=%s",
+    LOG_INFO("一次性传输票据签发成功，用户=%d，命令类型=%d，路径=%s，范围=%lld-%lld，数据源=%s:%s，票据编号=%s",
              user_id,
              cmd_type,
              full_path,
+             (long long)range_start,
+             (long long)range_end,
+             source_ip,
+             source_port,
              ticket_id);
     return 0;
 }
@@ -155,7 +169,10 @@ int issue_transfer_ticket(int user_id, cmd_type_t cmd_type, const char *full_pat
  * @return 成功返回 0，失败返回 -1
  */
 int verify_and_consume_transfer_ticket(const char *ticket, int *user_id, cmd_type_t *cmd_type,
-                                       char *full_path, size_t full_path_size) {
+                                       char *full_path, size_t full_path_size,
+                                       off_t *range_start, off_t *range_end,
+                                       char *source_ip, size_t source_ip_size,
+                                       char *source_port, size_t source_port_size) {
     char ticket_id[TRANSFER_TICKET_ID_LEN] = {0};
     int parsed_cmd_type = 0;
     time_t now = time(NULL);
@@ -164,15 +181,25 @@ int verify_and_consume_transfer_ticket(const char *ticket, int *user_id, cmd_typ
 
     if (ticket == NULL || ticket[0] == '\0' ||
         user_id == NULL || cmd_type == NULL ||
-        full_path == NULL || full_path_size == 0) {
+        full_path == NULL || full_path_size == 0 ||
+        range_start == NULL || range_end == NULL ||
+        source_ip == NULL || source_ip_size == 0 ||
+        source_port == NULL || source_port_size == 0) {
         return -1;
     }
 
+    // 第一步：先校验 JWT 本身有没有被篡改、有没有过期，并把负载字段解析出来。
     if (jwt_verify_transfer_ticket(ticket,
                                    user_id,
                                    &parsed_cmd_type,
                                    full_path,
                                    full_path_size,
+                                   range_start,
+                                   range_end,
+                                   source_ip,
+                                   source_ip_size,
+                                   source_port,
+                                   source_port_size,
                                    ticket_id,
                                    sizeof(ticket_id)) != 0) {
         return -1;
@@ -183,9 +210,11 @@ int verify_and_consume_transfer_ticket(const char *ticket, int *user_id, cmd_typ
     // 先统一清理过期票据，再查找当前票据，避免把已经过期的旧票据误判为仍然有效。
     cleanup_expired_tickets(now);
 
+    // 第二步：再去内存票据表里查这张票据是否还处于“未使用”状态。
     for (i = 0; i < MAX_TRANSFER_TICKET_COUNT; ++i) {
         if (g_transfer_tickets[i].active == 1 &&
             strcmp(g_transfer_tickets[i].ticket_id, ticket_id) == 0) {
+            // 找到后立刻清空，表示这张票据从这一刻开始失效。
             memset(&g_transfer_tickets[i], 0, sizeof(TransferTicketNode));
             found = 1;
             break;
@@ -200,10 +229,14 @@ int verify_and_consume_transfer_ticket(const char *ticket, int *user_id, cmd_typ
     }
 
     *cmd_type = (cmd_type_t)parsed_cmd_type;
-    LOG_INFO("一次性传输票据消费成功，用户=%d，命令类型=%d，路径=%s，票据编号=%s",
+    LOG_INFO("一次性传输票据消费成功，用户=%d，命令类型=%d，路径=%s，范围=%lld-%lld，数据源=%s:%s，票据编号=%s",
              *user_id,
              parsed_cmd_type,
              full_path,
+             (long long)(*range_start),
+             (long long)(*range_end),
+             source_ip,
+             source_port,
              ticket_id);
     return 0;
 }

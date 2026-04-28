@@ -13,6 +13,7 @@
 #include "client_state.h"
 #include "client_command_handle.h"   // 新增头文件
 #include "log.h"
+#include "storage_paths.h"
 
 /**
  * @brief  显示客户端未登录菜单，并处理登录/注册流程
@@ -87,6 +88,31 @@ static void load_value_or_default(const char *key, char *value, size_t value_sz,
 }
 
 /**
+ * @brief  加载并初始化客户端本地统一文件目录
+ * @param  state 客户端统一状态结构体
+ * @return 成功返回 0，失败返回 -1
+ */
+static int init_client_file_dir(ClientState *state) {
+    char dir_name[128] = {0};
+
+    load_value_or_default("client_file_dir", dir_name, sizeof(dir_name), "client_files");
+
+    if (get_client_file_dir_path(state->client_file_dir,
+                                 sizeof(state->client_file_dir),
+                                 dir_name) != 0) {
+        return -1;
+    }
+
+    // 客户端所有上传源文件和下载结果都统一放到这个目录里。
+    // 这里启动时先确保目录存在，后面的 puts/gets 才能直接复用。
+    if (ensure_storage_dir_exists(state->client_file_dir) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
  * @brief  初始化日志，并兼容不同启动目录下的日志相对路径
  * @param  level_str 日志级别字符串
  * @param  log_file 原始日志文件路径
@@ -151,6 +177,15 @@ int main(int argc, char *argv[])
     strcpy(state.current_path, "/");
     snprintf(state.server_ip, sizeof(state.server_ip), "%s", ip);
     snprintf(state.server_port, sizeof(state.server_port), "%s", port);
+
+    if (init_client_file_dir(&state) != 0) {
+        LOG_ERROR("初始化客户端文件目录失败");
+        pthread_mutex_destroy(&state.lock);
+        close_log();
+        return -1;
+    }
+
+    LOG_INFO("客户端统一文件目录=%s", state.client_file_dir);
 
     // 主动连接到服务端。
     init_socket(&state.ctrl_fd, ip, port);

@@ -8,13 +8,15 @@
 #include "file_cmds.h"
 #include "dao_vfs.h"
 #include "dao_file.h"
+#include "dao_file_source.h"
 #include "session.h"
 #include "protocol.h"
 #include "log.h"
 #include "path_utils.h"
+#include "config.h"
+#include "storage_paths.h"
 
 #define EMPTY_FILE_SHA256 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-#define FILE_STORE_DIR_NAME "files"
 
 /**
  * @brief  根据当前逻辑路径和用户参数拼接逻辑全路径
@@ -90,46 +92,25 @@ static int is_valid_vfs_name(const char *file_name) {
 }
 
 /**
- * @brief  获取服务端真实文件仓库根目录
- * @return 成功时返回可用目录字符串，失败时退回默认 SERVER_BASE_DIR
- */
-static const char *get_server_base_dir(void) {
-    // 服务端既可能从项目根目录启动，也可能从 bin 目录启动。
-    // 这里动态探测真实存在的 test 目录，避免后续把真实文件落到错误位置。
-    if (access(SERVER_BASE_DIR, F_OK) == 0) {
-        return SERVER_BASE_DIR;
-    }
-    if (access("./test", F_OK) == 0) {
-        return "./test";
-    }
-    return SERVER_BASE_DIR;
-}
-
-/**
- * @brief  确保真实文件仓库目录 test/files 存在
+ * @brief  确保真实文件仓库目录 test/server_files 存在
  * @param  store_dir 输出参数，用来保存最终真实文件仓库路径
  * @param  size store_dir 缓冲区大小
  * @return 成功返回 0，失败返回 -1
  */
 static int ensure_store_dir(char *store_dir, int size) {
-    struct stat st;
-    const char *base_dir = get_server_base_dir();
+    char dir_name[128] = {0};
 
     // 这个目录保存的是“真实文件实体”，而不是用户可见的逻辑目录结构。
     // paths 表中的目录树和这里完全解耦。
-    if (snprintf(store_dir, size, "%s/%s", base_dir, FILE_STORE_DIR_NAME) >= size) {
+    if (get_target("server_file_dir", dir_name) != 0) {
+        snprintf(dir_name, sizeof(dir_name), "%s", "server_files");
+    }
+
+    if (get_server_file_dir_path(store_dir, size, dir_name) != 0) {
         return -1;
     }
 
-    if (stat(store_dir, &st) == 0) {
-        return S_ISDIR(st.st_mode) ? 0 : -1;
-    }
-
-    if (mkdir(store_dir, 0777) == -1 && errno != EEXIST) {
-        return -1;
-    }
-
-    return 0;
+    return ensure_storage_dir_exists(store_dir);
 }
 
 /**
@@ -165,7 +146,7 @@ static int release_file_entity_if_unused(int file_id) {
     char real_path[MAX_PATH_LEN] = {0};
 
     // 第一步：先取出真实文件 hash。
-    // 删除逻辑节点后，如果引用计数归零，服务端就需要根据这个 hash 去定位 test/files/<sha256>。
+    // 删除逻辑节点后，如果引用计数归零，服务端就需要根据这个 hash 去定位 test/server_files/<sha256>。
     if (dao_file_get_info_by_id(file_id, sha256sum, &file_size) != 0) {
         return -1;
     }
@@ -193,6 +174,10 @@ static int release_file_entity_if_unused(int file_id) {
             LOG_WARN("回收真实文件失败，file_id=%d，路径=%s，错误码=%d", file_id, real_path, errno);
         }
     }
+
+    // 第五期引入了 file_sources 表。
+    // 当真实文件已经没有任何逻辑引用时，对应的数据源记录也要一起清掉。
+    dao_file_source_delete_by_file_id(file_id);
 
     // 最后删除 files 表记录，让数据库元数据与磁盘状态保持一致。
     return dao_file_delete(file_id);

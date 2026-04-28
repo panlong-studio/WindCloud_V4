@@ -20,4 +20,13 @@ int handle_puts_command(ClientState *state, const char *arg);
 int request_transfer_ticket(ClientState *state, cmd_type_t cmd_type, const char *arg,
                             char *ticket, size_t ticket_size);
 
+// 在控制连接上申请多点下载方案。
+int request_multi_gets_plan(ClientState *state, const char *arg, multi_gets_plan_packet_t *plan_packet);
+
+// 在控制连接上为某个下载分片申请区间票据。
+int request_gets_range_ticket(ClientState *state, const char *file_name,
+                              off_t range_start, off_t range_end,
+                              const char *source_ip, const char *source_port,
+                              char *ticket, size_t ticket_size);
+
 #endif

@@ -76,6 +76,17 @@ int init_database(const char* host, const char* user, const char* pwd, const cha
         "INDEX idx_user_parent (user_id, parent_id)"
         ") ENGINE=InnoDB;";
 
+    const char *create_file_sources_table =
+        "CREATE TABLE IF NOT EXISTS file_sources ("
+        "id INT AUTO_INCREMENT PRIMARY KEY, "
+        "file_id INT NOT NULL, "
+        "server_ip VARCHAR(64) NOT NULL, "
+        "server_port VARCHAR(16) NOT NULL, "
+        "status TINYINT NOT NULL DEFAULT 1, "
+        "UNIQUE KEY uniq_file_server (file_id, server_ip, server_port), "
+        "INDEX idx_file_id (file_id)"
+        ") ENGINE=InnoDB;";
+
     // 5. 依次执行建表。
     // 只要有一张核心表创建失败，就直接终止启动，避免服务端在残缺表结构上继续运行。
     if (mysql_query(conn, create_users_table)) {
@@ -92,6 +103,12 @@ int init_database(const char* host, const char* user, const char* pwd, const cha
 
     if (mysql_query(conn, create_paths_table)) {
         LOG_ERROR("创建 paths 表失败: %s", mysql_error(conn));
+        mysql_close(conn);
+        return -1;
+    }
+
+    if (mysql_query(conn, create_file_sources_table)) {
+        LOG_ERROR("创建 file_sources 表失败: %s", mysql_error(conn));
         mysql_close(conn);
         return -1;
     }
